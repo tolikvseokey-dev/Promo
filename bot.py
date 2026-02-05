@@ -106,12 +106,101 @@ def _norm_header(x) -> str:
 
 def parse_input_date(text: str) -> Optional[datetime]:
     """
-    Ожидаем DD.MM.YY (например 31.01.26).
-    Интерпретируем YY как 2000+YY.
+    Принимаем разные форматы даты, например:
+    - 310126
+    - 31.01.26
+    - 31\01\26
+    - 31/01/26
+    - 31ю01ю26 (частая ошибка раскладки/клавиатуры)
+    - 31,01,26
+    - 31-01-26
+    - 31 01 26
+    - 31.1.26
+    - 31.01.2026
+    - 31012026
+    Логика:
+    - вытаскиваем группы цифр (dd, mm, yy|yyyy) или цельную строку из 6/8 цифр
+    - валидируем и собираем datetime
     """
-    t = text.strip()
-    m = re.fullmatch(r"(\d{2})\.(\d{2})\.(\d{2})", t)
-    if not m:
+    if text is None:
+        return None
+
+    t = str(text).strip()
+
+    # Частые "разделители-ошибки" приводим к пробелу, чтобы digits-группы читались стабильно
+    t = t.replace("ю", ".").replace("Ю", ".")
+    t = t.replace("\\", ".").replace("/", ".").replace(",", ".").replace("-", ".").replace("_", ".")
+    t = re.sub(r"\s+", " ", t).strip()
+
+    # 1) Попытка: если только цифры (включая пробелы) — соберём их в одну строку
+    digits_only = re.sub(r"\D", "", t)
+
+    def _make(dd: int, mm: int, yyyy: int) -> Optional[datetime]:
+        try:
+            return datetime(yyyy, mm, dd)
+        except ValueError:
+            return None
+
+    # ddmmyy (6 цифр)
+    if len(digits_only) == 6:
+        dd = int(digits_only[0:2])
+        mm = int(digits_only[2:4])
+        yy = int(digits_only[4:6])
+        return _make(dd, mm, 2000 + yy)
+
+    # ddmmyyyy (8 цифр)
+    if len(digits_only) == 8:
+        dd = int(digits_only[0:2])
+        mm = int(digits_only[2:4])
+        yyyy = int(digits_only[4:8])
+        # если вдруг ввели 0000/0026 и т.п. — отсекаем
+        if 1900 <= yyyy <= 2100:
+            return _make(dd, mm, yyyy)
+        return None
+
+    # 2) Попытка: группы цифр (через любые разделители)
+    parts = re.findall(r"\d+", t)
+    if len(parts) >= 3:
+        dd = int(parts[0])
+        mm = int(parts[1])
+        yy_or_yyyy = parts[2]
+
+        # иногда хвостом прилетает время "31.01.26 12:00" — игнорируем лишнее
+        if len(yy_or_yyyy) == 2:
+            yyyy = 2000 + int(yy_or_yyyy)
+        elif len(yy_or_yyyy) == 4:
+            yyyy = int(yy_or_yyyy)
+        else:
+            return None
+
+        if not (1900 <= yyyy <= 2100):
+            return None
+        return _make(dd, mm, yyyy)
+
+    return None
+
+    t = text.strip().lower()
+
+    # заменить любые нецифры на точку
+    t = re.sub(r"[^0-9]", ".", t)
+    t = re.sub(r"\.+", ".", t).strip(".")
+
+    parts = t.split(".")
+
+    try:
+        if len(parts) == 1 and len(parts[0]) == 6:
+            # формат 310126
+            dd = int(parts[0][0:2])
+            mm = int(parts[0][2:4])
+            yy = int(parts[0][4:6])
+        elif len(parts) == 3:
+            dd, mm, yy = map(int, parts)
+        else:
+            return None
+
+        yyyy = 2000 + yy if yy < 100 else yy
+        return datetime(yyyy, mm, dd)
+    except Exception:
         return None
     dd, mm, yy = map(int, m.groups())
     yyyy = 2000 + yy
@@ -351,7 +440,7 @@ def weekly_network(w: pd.DataFrame, iso_year: int, iso_week: int) -> Dict[str, f
 # =========================
 # СБОРКА ОТЧЁТА (ЭТАЛОН)
 # =========================
-def build_report(report_date: datetime) -> str:
+def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
     required = [
         path_for("roster", 0),
         path_for("plans", 0),
@@ -363,7 +452,9 @@ def build_report(report_date: datetime) -> str:
     ]
     missing = [p for p in required if not os.path.exists(p)]
     if missing:
-        return "❌ Не хватает файлов:\n" + "\n".join([f"• {os.path.basename(x)}" for x in missing])
+        return (\"❌ Не хватает файлов:
+\" + \"
+\".join([f\"• {os.path.basename(x)}\" for x in missing]), None)
 
     store_rm, store_name = load_roster_maps(path_for("roster", 0))
 
@@ -500,6 +591,44 @@ def build_report(report_date: datetime) -> str:
     wow25_to = pct_change(wk25["to"], wk25_prev["to"])
     wow25_checks = pct_change(wk25["checks"], wk25_prev["checks"])
     wow25_avg = pct_change(wk25["avg"], wk25_prev["avg"])
+    # =========================
+    # СЛУЖЕБНОЕ СООБЩЕНИЕ (отдельным сообщением)
+    # - Исключённые из LFL MTD (лавки, которые есть только в одном из годов за период)
+    # - База лавок для недели к неделе (сколько лавок участвовало в каждой неделе каждого года)
+    # =========================
+    stores26_mtd = set(s26_mtd.index.astype(str)) if not s26_mtd.empty else set()
+    stores25_mtd = set(s25_mtd.index.astype(str)) if not s25_mtd.empty else set()
+    excluded_lfl = sorted(list((stores26_mtd ^ stores25_mtd)))  # симм.разность
+
+    def _store_label_plain(code_: str) -> str:
+        nm_ = store_name.get(code_, "").strip()
+        return f"{code_} {nm_}".strip() if nm_ else code_
+
+    # База лавок по неделям (у WoW ничего не исключаем)
+    wk26_stores = int(w26[(w26["iso_year"] == cur_iso_year) & (w26["iso_week"] == cur_week)]["store_code"].nunique())
+    wk26_prev_stores = int(w26[(w26["iso_year"] == prev_iso_year) & (w26["iso_week"] == prev_week)]["store_code"].nunique())
+    wk25_stores = int(w25[(w25["iso_year"] == (cur_iso_year - 1)) & (w25["iso_week"] == cur_week)]["store_code"].nunique())
+    wk25_prev_stores = int(w25[(w25["iso_year"] == (prev_iso_year - 1)) & (w25["iso_week"] == prev_week)]["store_code"].nunique())
+
+    extra_lines: List[str] = []
+    extra_lines.append(SEP)
+    extra_lines.append("ℹ️ <b>СЛУЖЕБНАЯ ИНФОРМАЦИЯ</b>")
+    extra_lines.append("")
+    extra_lines.append("<b>Исключены из LFL MTD</b> (нет сопоставимых данных 2026↔2025 за период):")
+    if excluded_lfl:
+        for c in excluded_lfl:
+            extra_lines.append(f"• {_store_label_plain(c)}")
+    else:
+        extra_lines.append("—")
+    extra_lines.append("")
+    extra_lines.append(f"Исключено: <b>{len(excluded_lfl)}</b> лавок")
+    extra_lines.append(f"LFL база: <b>{len(common)}</b> лавок")
+    extra_lines.append("")
+    extra_lines.append(f"<b>База лавок | Неделя к неделе</b> ({week_header}):")
+    extra_lines.append(f"2026: <b>{wk26_stores}</b> (нед.{cur_week}) / <b>{wk26_prev_stores}</b> (нед.{prev_week})")
+    extra_lines.append(f"2025: <b>{wk25_stores}</b> (нед.{cur_week}) / <b>{wk25_prev_stores}</b> (нед.{prev_week})")
+    extra_text = "\n".join(extra_lines)
+
 
     # ====== СБОРКА ТЕКСТА (как в эталоне) ======
     period_str = f"{mtd_start_26:%d.%m}–{mtd_end_26:%d.%m}"
@@ -613,7 +742,7 @@ def build_report(report_date: datetime) -> str:
     )
 
 
-    return "\n".join(lines)
+    return ("\n".join(lines), extra_text)
 
 
 # =========================
@@ -697,12 +826,14 @@ def on_text(m):
             return
 
         try:
-            text = build_report(dt)
+            main_text, extra_text = build_report(dt)
         except Exception as e:
-            text = f"❌ Ошибка при расчёте: {e}"
+            main_text, extra_text = (f"❌ Ошибка при расчёте: {e}", None)
 
         WAITING_FOR_REPORT_DATE[m.chat.id] = False
-        bot.send_message(m.chat.id, text)
+        bot.send_message(m.chat.id, main_text)
+        if extra_text:
+            bot.send_message(m.chat.id, extra_text)
         return
 
     if m.text.strip().startswith("/"):
@@ -713,3 +844,4 @@ def on_text(m):
 if __name__ == "__main__":
     print("Bot is running...")
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
+
