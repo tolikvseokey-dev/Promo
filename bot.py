@@ -21,13 +21,16 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# состояния ввода даты для /report
+# Состояние: ждём дату после /report
 WAITING_FOR_REPORT_DATE: Dict[int, bool] = {}
 
 
 # =========================
-# ФОРМАТИРОВАНИЕ / УТИЛИТЫ
+# УТИЛИТЫ / ФОРМАТЫ
 # =========================
+SEP = "━━━━━━━━━━━━━━━━━━━━━━"
+
+
 def _safe_num(x) -> float:
     if pd.isna(x):
         return np.nan
@@ -109,8 +112,19 @@ def parse_input_date(text: str) -> Optional[datetime]:
         return None
 
 
+def iso_prev_week(iso_year: int, iso_week: int) -> Tuple[int, int]:
+    """
+    Предыдущая неделя по номеру (корректно на границе года).
+    В тексте ISO не показываем — только для расчёта.
+    """
+    d = datetime.fromisocalendar(iso_year, iso_week, 1)  # понедельник
+    d2 = d - timedelta(days=7)
+    iso2 = d2.isocalendar()
+    return int(iso2.year), int(iso2.week)
+
+
 # =========================
-# РАСПОЗНАВАНИЕ / ПУТИ ФАЙЛОВ
+# ФАЙЛЫ / РАСПОЗНАВАНИЕ
 # =========================
 def detect_file_kind(filename: str) -> Tuple[str, int]:
     """
@@ -155,8 +169,8 @@ def path_for(kind: str, year: int) -> str:
 # =========================
 def read_metric_file(path: str, metric: str) -> pd.DataFrame:
     """
-    Метрики: НЕ читаем по названиям столбцов.
-    Берём первые 4 столбца в порядке:
+    Метрики НЕ читаем по названиям столбцов.
+    Берём первые 4 столбца:
     1) РМ, 2) Торговые точки, 3) значение, 4) дата
     """
     df = pd.read_excel(path)
@@ -169,7 +183,6 @@ def read_metric_file(path: str, metric: str) -> pd.DataFrame:
 
     df = df.dropna(subset=["date", "store_code"])
     df["metric"] = metric
-
     return df[["date", "store_code", "rm_raw", "metric", "value"]]
 
 
@@ -177,9 +190,9 @@ def load_roster_map(roster_path: str) -> Dict[str, str]:
     roster = pd.read_excel(roster_path, sheet_name="Лавки")
 
     if "№" not in roster.columns:
-        raise ValueError("В ростере не нашёл колонку '№'.")
+        raise ValueError("В ростере не нашла колонку '№'.")
     if "Регион" not in roster.columns:
-        raise ValueError("В ростере не нашёл колонку 'Регион'.")
+        raise ValueError("В ростере не нашла колонку 'Регион'.")
 
     def _mk_code(x):
         if pd.isna(x):
@@ -204,26 +217,33 @@ def attach_rm(df: pd.DataFrame, store_rm: Dict[str, str]) -> pd.DataFrame:
 
 def make_wide(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+
+    # недели для расчёта "неделя к неделе"
+    iso = df["date"].dt.isocalendar()
+    df["iso_year"] = iso["year"].astype(int)
+    df["iso_week"] = iso["week"].astype(int)
+
     wide = (
         df.pivot_table(
-            index=["date", "store_code", "rm"],
+            index=["date", "iso_year", "iso_week", "store_code", "rm"],
             columns="metric",
             values="value",
             aggfunc="sum",
         )
         .reset_index()
     )
+
     for col in ["TO", "CHECKS", "BASKET"]:
         if col not in wide.columns:
             wide[col] = np.nan
-    # Ср. чек — взвешенно
+
     wide["AVG"] = wide["TO"] / wide["CHECKS"]
     return wide
 
 
 def read_plans(plans_path: str, store_rm: Dict[str, str]) -> pd.DataFrame:
     """
-    План — читаем по заголовкам, но шапка может быть не в первой строке.
+    План — шапка может быть не в первой строке (например, сверху "Примененные фильтры").
     Ищем строку, где одновременно есть 'торговые точки' и 'план', и используем её как header.
     """
     raw = pd.read_excel(plans_path, header=None)
@@ -243,13 +263,13 @@ def read_plans(plans_path: str, store_rm: Dict[str, str]) -> pd.DataFrame:
                 break
 
     if header_row is None:
-        raise ValueError("В файле планов не нашёл строку заголовков с 'Торговые точки' и 'План'.")
+        raise ValueError("В файле планов не нашла строку заголовков с 'Торговые точки' и 'План'.")
 
     df = pd.read_excel(plans_path, header=header_row)
     col_map = {_norm_header(c): c for c in df.columns}
 
     if "торговые точки" not in col_map or "план" not in col_map:
-        raise ValueError("В файле планов не нашёл колонки 'Торговые точки' и 'План' (после распознавания шапки).")
+        raise ValueError("В файле планов не нашла колонки 'Торговые точки' и 'План'.")
 
     store_col = col_map["торговые точки"]
     plan_col = col_map["план"]
@@ -265,22 +285,10 @@ def read_plans(plans_path: str, store_rm: Dict[str, str]) -> pd.DataFrame:
 
 
 # =========================
-# ПЕРИОДЫ (по введённой дате)
+# ПЕРИОДЫ
 # =========================
 def period_mtd(report_date: datetime) -> Tuple[pd.Timestamp, pd.Timestamp]:
     start = pd.Timestamp(report_date.year, report_date.month, 1)
-    end = pd.Timestamp(report_date.year, report_date.month, report_date.day)
-    return start, end
-
-
-def period_last_week_25(report_date: datetime) -> Tuple[pd.Timestamp, pd.Timestamp]:
-    """
-    "Последняя неделя месяца" по твоей логике:
-    25-е число -> введённая дата (включительно)
-    """
-    if report_date.day < 25:
-        raise ValueError("Для блока 'последняя неделя' введи дату с 25 по конец месяца.")
-    start = pd.Timestamp(report_date.year, report_date.month, 25)
     end = pd.Timestamp(report_date.year, report_date.month, report_date.day)
     return start, end
 
@@ -319,9 +327,19 @@ def per_store_period(w: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) ->
     return g
 
 
+def network_week(w: pd.DataFrame, iso_year: int, iso_week: int) -> Dict[str, float]:
+    d = w[(w["iso_year"] == iso_year) & (w["iso_week"] == iso_week)]
+    to = float(np.nansum(d["TO"]))
+    checks = float(np.nansum(d["CHECKS"]))
+    avg = to / checks if checks else np.nan
+    return {"to": to, "checks": checks, "avg": avg}
+
+
 def top_anti_3(series: pd.Series) -> Tuple[pd.Series, pd.Series]:
     s = series.replace([np.inf, -np.inf], np.nan).dropna()
-    return s.sort_values(ascending=False).head(3), s.sort_values(ascending=True).head(3)
+    top = s.sort_values(ascending=False).head(3)
+    anti = s.sort_values(ascending=True).head(3)
+    return top, anti
 
 
 # =========================
@@ -366,38 +384,48 @@ def build_report(report_date: datetime) -> str:
     df25 = attach_rm(df25, store_rm)
     w25 = make_wide(df25)
 
-    # Проверим, что введённая дата есть в данных 2026 (хотя бы где-то)
     report_ts = pd.Timestamp(report_date.year, report_date.month, report_date.day)
-    if w26[(w26["date"] == report_ts)].empty:
+
+    # Проверка: введённая дата должна быть в данных 2026
+    if w26[w26["date"] == report_ts].empty:
         return (
             "❌ В данных 2026 нет записей за введённую дату.\n"
-            f"Ты ввёл: {report_date:%d.%m.%y}\n"
+            f"Ты ввёл(а): {report_date:%d.%m.%y}\n"
             "Проверь, что файлы ТО/чеки/длина 26 загружены и содержат эту дату."
         )
 
-    # Периоды
+    # Периоды MTD
     mtd_start_26, mtd_end_26 = period_mtd(report_date)
     mtd_start_25, mtd_end_25 = same_period_prev_year(mtd_start_26, mtd_end_26)
 
-    # "последняя неделя" (25 -> дата)
-    lastw_start_26, lastw_end_26 = period_last_week_25(report_date)
-    lastw_start_25, lastw_end_25 = same_period_prev_year(lastw_start_26, lastw_end_26)
-
-    # MTD сеть 2026
+    # Метрики сети MTD (2026)
     net_mtd_26 = network_metrics(w26, mtd_start_26, mtd_end_26)
 
-    # Планы
+    # Планы + план на дату + выполнение
     plans = read_plans(path_for("plans", 0), store_rm)
 
-    # планы считаем по лавкам, которые реально есть в периоде MTD
-    stores_in_mtd = set(w26[(w26["date"] >= mtd_start_26) & (w26["date"] <= mtd_end_26)]["store_code"].unique())
+    stores_in_mtd = set(
+        w26[(w26["date"] >= mtd_start_26) & (w26["date"] <= mtd_end_26)]["store_code"].unique()
+    )
     plans_used = plans[plans["store_code"].isin(stores_in_mtd)].copy()
 
     month_plan_total = float(np.nansum(plans_used["month_plan"]))
     plan_on_date_total = plan_to_date(month_plan_total, report_date)
-    perf_net = net_mtd_26["to"] / plan_on_date_total if plan_on_date_total and not np.isnan(plan_on_date_total) else np.nan
+    perf_net = (
+        net_mtd_26["to"] / plan_on_date_total
+        if plan_on_date_total and not np.isnan(plan_on_date_total)
+        else np.nan
+    )
 
-    # РМ — полный список (по факту/плану)
+    # РМ — ВСЕ (из ростера + планов + факта)
+    rms_from_roster = {v for v in store_rm.values() if v and str(v).strip()}
+    rms_from_plans = {str(x).strip() for x in plans_used["rm"].dropna().astype(str).tolist()}
+    rms_from_fact = {
+        str(x).strip()
+        for x in w26[(w26["date"] >= mtd_start_26) & (w26["date"] <= mtd_end_26)]["rm"].dropna().astype(str).tolist()
+    }
+    all_rms = sorted({*rms_from_roster, *rms_from_plans, *rms_from_fact})
+
     fact_by_rm = (
         w26[(w26["date"] >= mtd_start_26) & (w26["date"] <= mtd_end_26)]
         .groupby("rm", as_index=False)["TO"]
@@ -405,119 +433,129 @@ def build_report(report_date: datetime) -> str:
         .rename(columns={"TO": "fact"})
     )
     plans_by_rm = plans_used.groupby("rm", as_index=False)["month_plan"].sum()
-    rm = fact_by_rm.merge(plans_by_rm, on="rm", how="outer")
-    rm["plan_on_date"] = rm["month_plan"].apply(lambda x: plan_to_date(x, report_date))
-    rm["perf"] = rm["fact"] / rm["plan_on_date"]
-    rm = rm.sort_values("perf", ascending=False)
+
+    rm_tbl = pd.DataFrame({"rm": all_rms})
+    rm_tbl = rm_tbl.merge(fact_by_rm, on="rm", how="left").merge(plans_by_rm, on="rm", how="left")
+    rm_tbl["plan_on_date"] = rm_tbl["month_plan"].apply(lambda x: plan_to_date(x, report_date))
+    rm_tbl["perf"] = rm_tbl["fact"] / rm_tbl["plan_on_date"]
+    rm_tbl = rm_tbl.sort_values("perf", ascending=False, na_position="last")
 
     # LFL MTD (пересечение лавок)
     s26_mtd = per_store_period(w26, mtd_start_26, mtd_end_26).set_index("store_code")
     s25_mtd = per_store_period(w25, mtd_start_25, mtd_end_25).set_index("store_code")
-    common_mtd = sorted(set(s26_mtd.index).intersection(set(s25_mtd.index)))
+    common = sorted(set(s26_mtd.index).intersection(set(s25_mtd.index)))
 
-    to26_lfl = float(np.nansum(s26_mtd.loc[common_mtd, "TO"])) if common_mtd else np.nan
-    to25_lfl = float(np.nansum(s25_mtd.loc[common_mtd, "TO"])) if common_mtd else np.nan
-    ch26_lfl = float(np.nansum(s26_mtd.loc[common_mtd, "CHECKS"])) if common_mtd else np.nan
-    ch25_lfl = float(np.nansum(s25_mtd.loc[common_mtd, "CHECKS"])) if common_mtd else np.nan
+    to26 = float(np.nansum(s26_mtd.loc[common, "TO"])) if common else np.nan
+    to25 = float(np.nansum(s25_mtd.loc[common, "TO"])) if common else np.nan
+    ch26 = float(np.nansum(s26_mtd.loc[common, "CHECKS"])) if common else np.nan
+    ch25 = float(np.nansum(s25_mtd.loc[common, "CHECKS"])) if common else np.nan
 
-    avg26_lfl = to26_lfl / ch26_lfl if ch26_lfl else np.nan
-    avg25_lfl = to25_lfl / ch25_lfl if ch25_lfl else np.nan
+    avg26 = to26 / ch26 if ch26 else np.nan
+    avg25 = to25 / ch25 if ch25 else np.nan
 
-    lfl_to = pct_change(to26_lfl, to25_lfl)
-    lfl_checks = pct_change(ch26_lfl, ch25_lfl)
-    lfl_avg = pct_change(avg26_lfl, avg25_lfl)
+    lfl_to = pct_change(to26, to25)
+    lfl_checks = pct_change(ch26, ch25)
+    lfl_avg = pct_change(avg26, avg25)
 
-    # ТОП/АНТИ-3 LFL (MTD) — по лавкам
-    yoy = pd.DataFrame(index=common_mtd)
-    if common_mtd:
-        yoy["TO"] = (s26_mtd.loc[common_mtd, "TO"] - s25_mtd.loc[common_mtd, "TO"]) / s25_mtd.loc[common_mtd, "TO"]
-        yoy["CHECKS"] = (s26_mtd.loc[common_mtd, "CHECKS"] - s25_mtd.loc[common_mtd, "CHECKS"]) / s25_mtd.loc[common_mtd, "CHECKS"]
-        yoy["AVG"] = (
-            (s26_mtd.loc[common_mtd, "TO"] / s26_mtd.loc[common_mtd, "CHECKS"])
-            - (s25_mtd.loc[common_mtd, "TO"] / s25_mtd.loc[common_mtd, "CHECKS"])
-        ) / (s25_mtd.loc[common_mtd, "TO"] / s25_mtd.loc[common_mtd, "CHECKS"])
-        yoy = yoy.replace([np.inf, -np.inf], np.nan)
+    # ТОП/АНТИ-ТОП по LFL (лавки)
+    lfl_store = pd.DataFrame(index=common)
+    if common:
+        lfl_store["TO"] = (s26_mtd.loc[common, "TO"] - s25_mtd.loc[common, "TO"]) / s25_mtd.loc[common, "TO"]
+        lfl_store["CHECKS"] = (s26_mtd.loc[common, "CHECKS"] - s25_mtd.loc[common, "CHECKS"]) / s25_mtd.loc[common, "CHECKS"]
+        lfl_store["AVG"] = (s26_mtd.loc[common, "AVG"] - s25_mtd.loc[common, "AVG"]) / s25_mtd.loc[common, "AVG"]
+        lfl_store = lfl_store.replace([np.inf, -np.inf], np.nan)
 
-    top_to, anti_to = top_anti_3(yoy["TO"]) if common_mtd else (pd.Series(dtype=float), pd.Series(dtype=float))
-    top_checks, anti_checks = top_anti_3(yoy["CHECKS"]) if common_mtd else (pd.Series(dtype=float), pd.Series(dtype=float))
-    top_avg, anti_avg = top_anti_3(yoy["AVG"]) if common_mtd else (pd.Series(dtype=float), pd.Series(dtype=float))
+    top_to, anti_to = top_anti_3(lfl_store["TO"]) if common else (pd.Series(dtype=float), pd.Series(dtype=float))
+    top_checks, anti_checks = top_anti_3(lfl_store["CHECKS"]) if common else (pd.Series(dtype=float), pd.Series(dtype=float))
+    top_avg, anti_avg = top_anti_3(lfl_store["AVG"]) if common else (pd.Series(dtype=float), pd.Series(dtype=float))
 
-    # Блок "последняя неделя (25->дата)" — и её LFL сравнение (с тем же периодом прошлого года)
-    net_lastw_26 = network_metrics(w26, lastw_start_26, lastw_end_26)
-    net_lastw_25 = network_metrics(w25, lastw_start_25, lastw_end_25)
+    # Динамика "неделя к неделе" — неделя определяется введённой датой
+    iso = report_date.isocalendar()
+    iso_y = int(iso.year)
+    iso_w = int(iso.week)
+    prev_y, prev_w = iso_prev_week(iso_y, iso_w)
 
-    lfl_lastw_to = pct_change(net_lastw_26["to"], net_lastw_25["to"])
-    lfl_lastw_checks = pct_change(net_lastw_26["checks"], net_lastw_25["checks"])
-    lfl_lastw_avg = pct_change(net_lastw_26["avg"], net_lastw_25["avg"])
+    wk26 = network_week(w26, iso_y, iso_w)
+    wk26_prev = network_week(w26, prev_y, prev_w)
 
-    # ========= Формируем сообщение =========
-    period_mtd_str = f"{mtd_start_26:%d.%m}–{mtd_end_26:%d.%m}"
-    period_lastw_str = f"{lastw_start_26:%d.%m}–{lastw_end_26:%d.%m}"
+    w26_to = pct_change(wk26["to"], wk26_prev["to"])
+    w26_checks = pct_change(wk26["checks"], wk26_prev["checks"])
+    w26_avg = pct_change(wk26["avg"], wk26_prev["avg"])
+
+    # 2025: тот же номер недели и предыдущая в 2025
+    wk25 = network_week(w25, iso_y - 1, iso_w)
+    wk25_prev = network_week(w25, prev_y - 1, prev_w)
+
+    w25_to = pct_change(wk25["to"], wk25_prev["to"])
+    w25_checks = pct_change(wk25["checks"], wk25_prev["checks"])
+    w25_avg = pct_change(wk25["avg"], wk25_prev["avg"])
+
+    # ====== СБОРКА ТЕКСТА ======
+    period_str = f"{mtd_start_26:%d.%m}–{mtd_end_26:%d.%m}"
 
     lines: List[str] = []
-
-    lines.append(f"📊 <b>АНАЛИТИКА СЕТИ</b> | MTD ({period_mtd_str})")
-    lines.append(f"Дата отчёта: <b>{report_date:%d.%m.%y}</b>")
+    lines.append(f"📊 <b>АНАЛИТИКА СЕТИ</b> | MTD ({period_str})")
+    lines.append(SEP)
     lines.append("")
-    lines.append(f"ТО Факт: <b>{fmt_money(net_mtd_26['to'])} ₽</b>")
+    lines.append(f"ТО Факт:         <b>{fmt_money(net_mtd_26['to'])} ₽</b>")
     lines.append(f"ТО План на дату: <b>{fmt_money(plan_on_date_total)} ₽</b>")
-    lines.append(f"Выполнение плана: <b>{fmt_pct(perf_net)}</b>")
+    lines.append(f"Выполнение:      <b>{fmt_pct(perf_net)}</b>")
     lines.append("")
-    lines.append(f"Чеки: <b>{fmt_money(net_mtd_26['checks'])}</b>")
-    lines.append(f"Ср. чек: <b>{fmt_money(net_mtd_26['avg'])} ₽</b>")
-    lines.append(f"Длина чека: <b>{fmt_num(net_mtd_26['basket'], 2)}</b>")
-
+    lines.append(f"Чеки:            <b>{fmt_money(net_mtd_26['checks'])}</b>")
+    lines.append(f"Ср. чек:         <b>{fmt_money(net_mtd_26['avg'])} ₽</b>")
+    lines.append(f"Длина чека:      <b>{fmt_num(net_mtd_26['basket'], 2)}</b>")
     lines.append("")
+    lines.append(SEP)
     lines.append("👥 <b>РМ</b> | выполнение плана (MTD)")
-    for _, r in rm.iterrows():
-        rm_name = str(r["rm"]) if pd.notna(r["rm"]) else "—"
-        lines.append(f"{rm_name} — <b>{fmt_pct(r['perf'])}</b>")
-
     lines.append("")
+    for _, r in rm_tbl.iterrows():
+        rm_name = str(r["rm"]).strip()
+        lines.append(f"• {rm_name} — <b>{fmt_pct(r['perf'])}</b>")
+    lines.append("")
+    lines.append(SEP)
     lines.append("📈 <b>LFL</b> | MTD (2026 vs 2025)")
-    lines.append(f"ТО: <b>{fmt_pct(lfl_to)}</b>")
-    lines.append(f"Чеки: <b>{fmt_pct(lfl_checks)}</b>")
-    lines.append(f"Ср. чек: <b>{fmt_pct(lfl_avg)}</b>")
+    lines.append("")
+    lines.append(
+        f"ТО: <b>{fmt_pct(lfl_to)}</b>   |   Чеки: <b>{fmt_pct(lfl_checks)}</b>   |   Ср. чек: <b>{fmt_pct(lfl_avg)}</b>"
+    )
+    lines.append("")
 
-    def render_top_block(title: str, s: pd.Series):
-        lines.append("")
+    def render_top_anti_block(title: str, top_s: pd.Series, anti_s: pd.Series):
+        lines.append(SEP)
         lines.append(title)
-        if s is None or len(s) == 0:
+        lines.append("")
+        lines.append("<b>ТОП-3:</b>")
+        if top_s is None or len(top_s) == 0:
             lines.append("—")
-            return
-        for i, (k, v) in enumerate(s.items(), start=1):
-            lines.append(f"{i}) {k}  <b>{fmt_pct(v)}</b>")
+        else:
+            for i, (k, v) in enumerate(top_s.items(), start=1):
+                lines.append(f"{i}) {k}  <b>{fmt_pct(v)}</b>")
+        lines.append("")
+        lines.append("<b>АНТИ-ТОП-3:</b>")
+        if anti_s is None or len(anti_s) == 0:
+            lines.append("—")
+        else:
+            for i, (k, v) in enumerate(anti_s.items(), start=1):
+                lines.append(f"{i}) {k}  <b>{fmt_pct(v)}</b>")
+        lines.append("")
 
-    render_top_block("🔥 <b>ТОП-3 LFL (MTD) — ТО</b>", top_to)
-    render_top_block("❄️ <b>АНТИ-ТОП-3 LFL (MTD) — ТО</b>", anti_to)
+    render_top_anti_block("📊 <b>ТОП / АНТИ-ТОП LFL (MTD) — ТО</b>", top_to, anti_to)
+    render_top_anti_block("📊 <b>ТОП / АНТИ-ТОП LFL (MTD) — Чеки</b>", top_checks, anti_checks)
+    render_top_anti_block("📊 <b>ТОП / АНТИ-ТОП LFL (MTD) — Ср. чек</b>", top_avg, anti_avg)
 
-    render_top_block("🔥 <b>ТОП-3 LFL (MTD) — Чеки</b>", top_checks)
-    render_top_block("❄️ <b>АНТИ-ТОП-3 LFL (MTD) — Чеки</b>", anti_checks)
-
-    render_top_block("🔥 <b>ТОП-3 LFL (MTD) — Ср. чек</b>", top_avg)
-    render_top_block("❄️ <b>АНТИ-ТОП-3 LFL (MTD) — Ср. чек</b>", anti_avg)
-
+    lines.append(SEP)
+    lines.append("📊 <b>ДИНАМИКА НЕДЕЛЯ К НЕДЕЛЕ</b>")
     lines.append("")
-    lines.append(f"📊 <b>ПОСЛЕДНЯЯ НЕДЕЛЯ МЕСЯЦА</b> (по правилу 25→дата) | {period_lastw_str}")
-    lines.append("📌 LFL (2026 vs 2025) по этому же периоду")
-    lines.append(f"ТО: <b>{fmt_pct(lfl_lastw_to)}</b>")
-    lines.append(f"Чеки: <b>{fmt_pct(lfl_lastw_checks)}</b>")
-    lines.append(f"Ср. чек: <b>{fmt_pct(lfl_lastw_avg)}</b>")
-
+    lines.append("<b>2026:</b>")
+    lines.append(
+        f"ТО: <b>{fmt_pct(w26_to)}</b>   |   Чеки: <b>{fmt_pct(w26_checks)}</b>   |   Ср. чек: <b>{fmt_pct(w26_avg)}</b>"
+    )
     lines.append("")
-    lines.append("🧠 <b>ВЫВОДЫ</b>")
+    lines.append("<b>2025:</b>")
     lines.append(
-        f"1) LFL MTD: ТО {fmt_pct(lfl_to)}, Чеки {fmt_pct(lfl_checks)}, Ср. чек {fmt_pct(lfl_avg)} — баланс трафика и среднего чека."
+        f"ТО: <b>{fmt_pct(w25_to)}</b>   |   Чеки: <b>{fmt_pct(w25_checks)}</b>   |   Ср. чек: <b>{fmt_pct(w25_avg)}</b>"
     )
-    lines.append(
-        f"2) Выполнение плана по сети: {fmt_pct(perf_net)} (план на дату) — при текущем темпе возможен риск недобора."
-    )
-    lines.append(
-        "3) Фокус — лавки АНТИ-ТОП-3 по LFL: они дают непропорционально большой минус сети."
-    )
-    lines.append(
-        f"4) По последней неделе (25→дата) LFL: ТО {fmt_pct(lfl_lastw_to)}, Чеки {fmt_pct(lfl_lastw_checks)}, Ср. чек {fmt_pct(lfl_lastw_avg)} — быстрый индикатор конца месяца."
-    )
+    lines.append("")
 
     return "\n".join(lines)
 
@@ -565,7 +603,7 @@ def on_document(m):
     if kind == "unknown":
         bot.send_message(
             m.chat.id,
-            "Не понял тип файла 🤔\n"
+            "Не поняла тип файла 🤔\n"
             "Назови файл так, чтобы было видно что это:\n"
             "• ТО 25 / ТО 26\n"
             "• чеки 25 / чеки 26\n"
@@ -586,14 +624,13 @@ def on_document(m):
 
     bot.send_message(
         m.chat.id,
-        f"✅ Сохранил: <b>{os.path.basename(save_path)}</b>\n"
+        f"✅ Сохранила: <b>{os.path.basename(save_path)}</b>\n"
         f"Тип: <b>{kind.upper()}</b>  Год: <b>{year if year else '—'}</b>"
     )
 
 
 @bot.message_handler(func=lambda msg: True, content_types=["text"])
 def on_text(m):
-    # если ждём дату — обрабатываем как дату отчёта
     if WAITING_FOR_REPORT_DATE.get(m.chat.id, False):
         dt = parse_input_date(m.text)
         if not dt:
@@ -604,7 +641,6 @@ def on_text(m):
             )
             return
 
-        # пробуем построить отчёт
         try:
             text = build_report(dt)
         except Exception as e:
@@ -614,8 +650,6 @@ def on_text(m):
         bot.send_message(m.chat.id, text)
         return
 
-    # обычный текст вне режима даты
-    # (можно оставить подсказку, чтобы не молчал)
     if m.text.strip().startswith("/"):
         return
     bot.send_message(m.chat.id, "Напиши /report чтобы сделать отчёт 🙂")
@@ -624,3 +658,4 @@ def on_text(m):
 if __name__ == "__main__":
     print("Bot is running...")
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
+
