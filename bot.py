@@ -55,7 +55,16 @@ def fmt_money(x: float) -> str:
     return f"{x:,.0f}".replace(",", " ")
 
 
-def fmt_pct(x: float) -> str:
+def fmt_pct_signed(x: float) -> str:
+    """Для LFL / динамик: всегда со знаком +/− (если число)."""
+    if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))):
+        return "—"
+    sign = "+" if x > 0 else ""
+    return (sign + f"{x * 100:.1f}%").replace(".", ",")
+
+
+def fmt_pct_plain(x: float) -> str:
+    """Для выполнения плана: без плюса."""
     if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))):
         return "—"
     return f"{x * 100:.1f}%".replace(".", ",")
@@ -97,7 +106,7 @@ def _norm_header(x) -> str:
 
 def parse_input_date(text: str) -> Optional[datetime]:
     """
-    Ожидаем DD.MM.YY (например 27.01.26).
+    Ожидаем DD.MM.YY (например 31.01.26).
     Интерпретируем YY как 2000+YY.
     """
     t = text.strip()
@@ -112,15 +121,14 @@ def parse_input_date(text: str) -> Optional[datetime]:
         return None
 
 
-def iso_prev_week(iso_year: int, iso_week: int) -> Tuple[int, int]:
-    """
-    Предыдущая неделя по номеру (корректно на границе года).
-    В тексте ISO не показываем — только для расчёта.
-    """
-    d = datetime.fromisocalendar(iso_year, iso_week, 1)  # понедельник
+def iso_week_year(d: datetime) -> Tuple[int, int]:
+    iso = d.isocalendar()
+    return int(iso.year), int(iso.week)
+
+
+def prev_week_of(d: datetime) -> Tuple[int, int]:
     d2 = d - timedelta(days=7)
-    iso2 = d2.isocalendar()
-    return int(iso2.year), int(iso2.week)
+    return iso_week_year(d2)
 
 
 # =========================
@@ -128,7 +136,7 @@ def iso_prev_week(iso_year: int, iso_week: int) -> Tuple[int, int]:
 # =========================
 def detect_file_kind(filename: str) -> Tuple[str, int]:
     """
-    kind: to | checks | avg | basket | plans | roster | unknown
+    kind: to | checks | basket | plans | roster | unknown
     year: 25/26 если есть в имени, иначе 0
     """
     name = filename.lower().replace("ё", "е")
@@ -146,8 +154,6 @@ def detect_file_kind(filename: str) -> Tuple[str, int]:
 
     if "длин" in name or "наполн" in name:
         return "basket", year
-    if "ср" in name and "чек" in name:
-        return "avg", year
     if "чек" in name and "ср" not in name:
         return "checks", year
     if "то" in name or "выручк" in name:
@@ -186,13 +192,20 @@ def read_metric_file(path: str, metric: str) -> pd.DataFrame:
     return df[["date", "store_code", "rm_raw", "metric", "value"]]
 
 
-def load_roster_map(roster_path: str) -> Dict[str, str]:
+def load_roster_maps(roster_path: str) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """
+    Возвращает:
+    - store_code -> RM (Регион)
+    - store_code -> store_name (Лавка)
+    """
     roster = pd.read_excel(roster_path, sheet_name="Лавки")
 
     if "№" not in roster.columns:
         raise ValueError("В ростере не нашла колонку '№'.")
     if "Регион" not in roster.columns:
         raise ValueError("В ростере не нашла колонку 'Регион'.")
+    if "Лавка" not in roster.columns:
+        raise ValueError("В ростере не нашла колонку 'Лавка'.")
 
     def _mk_code(x):
         if pd.isna(x):
@@ -205,7 +218,9 @@ def load_roster_map(roster_path: str) -> Dict[str, str]:
     roster["store_code"] = roster["№"].apply(_mk_code)
     roster["store_code"] = roster["store_code"].astype(str).str.upper().str.strip()
 
-    return dict(zip(roster["store_code"], roster["Регион"].astype(str).str.strip()))
+    store_to_rm = dict(zip(roster["store_code"], roster["Регион"].astype(str).str.strip()))
+    store_to_name = dict(zip(roster["store_code"], roster["Лавка"].astype(str).str.strip()))
+    return store_to_rm, store_to_name
 
 
 def attach_rm(df: pd.DataFrame, store_rm: Dict[str, str]) -> pd.DataFrame:
@@ -217,8 +232,6 @@ def attach_rm(df: pd.DataFrame, store_rm: Dict[str, str]) -> pd.DataFrame:
 
 def make_wide(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-
-    # недели для расчёта "неделя к неделе"
     iso = df["date"].dt.isocalendar()
     df["iso_year"] = iso["year"].astype(int)
     df["iso_week"] = iso["week"].astype(int)
@@ -248,14 +261,14 @@ def read_plans(plans_path: str, store_rm: Dict[str, str]) -> pd.DataFrame:
     """
     raw = pd.read_excel(plans_path, header=None)
     header_row = None
-    for i in range(min(50, len(raw))):
+    for i in range(min(60, len(raw))):
         row_vals = [_norm_header(v) for v in raw.iloc[i].tolist()]
         if ("торговые точки" in row_vals) and ("план" in row_vals):
             header_row = i
             break
 
     if header_row is None:
-        for guess in range(0, 15):
+        for guess in range(0, 20):
             df_try = pd.read_excel(plans_path, header=guess)
             cols_norm = [_norm_header(c) for c in df_try.columns]
             if ("торговые точки" in cols_norm) and ("план" in cols_norm):
@@ -293,13 +306,6 @@ def period_mtd(report_date: datetime) -> Tuple[pd.Timestamp, pd.Timestamp]:
     return start, end
 
 
-def same_period_prev_year(start: pd.Timestamp, end: pd.Timestamp) -> Tuple[pd.Timestamp, pd.Timestamp]:
-    return (
-        pd.Timestamp(start.year - 1, start.month, start.day),
-        pd.Timestamp(end.year - 1, end.month, end.day),
-    )
-
-
 def plan_to_date(month_plan: float, report_date: datetime) -> float:
     if month_plan is None or (isinstance(month_plan, float) and np.isnan(month_plan)):
         return np.nan
@@ -327,14 +333,6 @@ def per_store_period(w: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) ->
     return g
 
 
-def network_week(w: pd.DataFrame, iso_year: int, iso_week: int) -> Dict[str, float]:
-    d = w[(w["iso_year"] == iso_year) & (w["iso_week"] == iso_week)]
-    to = float(np.nansum(d["TO"]))
-    checks = float(np.nansum(d["CHECKS"]))
-    avg = to / checks if checks else np.nan
-    return {"to": to, "checks": checks, "avg": avg}
-
-
 def top_anti_3(series: pd.Series) -> Tuple[pd.Series, pd.Series]:
     s = series.replace([np.inf, -np.inf], np.nan).dropna()
     top = s.sort_values(ascending=False).head(3)
@@ -342,8 +340,16 @@ def top_anti_3(series: pd.Series) -> Tuple[pd.Series, pd.Series]:
     return top, anti
 
 
+def weekly_network(w: pd.DataFrame, iso_year: int, iso_week: int) -> Dict[str, float]:
+    d = w[(w["iso_year"] == iso_year) & (w["iso_week"] == iso_week)]
+    to = float(np.nansum(d["TO"]))
+    checks = float(np.nansum(d["CHECKS"]))
+    avg = to / checks if checks else np.nan
+    return {"to": to, "checks": checks, "avg": avg}
+
+
 # =========================
-# СБОРКА ОТЧЁТА
+# СБОРКА ОТЧЁТА (ЭТАЛОН)
 # =========================
 def build_report(report_date: datetime) -> str:
     required = [
@@ -359,7 +365,7 @@ def build_report(report_date: datetime) -> str:
     if missing:
         return "❌ Не хватает файлов:\n" + "\n".join([f"• {os.path.basename(x)}" for x in missing])
 
-    store_rm = load_roster_map(path_for("roster", 0))
+    store_rm, store_name = load_roster_maps(path_for("roster", 0))
 
     # 2026
     df26 = pd.concat(
@@ -390,13 +396,14 @@ def build_report(report_date: datetime) -> str:
     if w26[w26["date"] == report_ts].empty:
         return (
             "❌ В данных 2026 нет записей за введённую дату.\n"
-            f"Ты ввёл(а): {report_date:%d.%m.%y}\n"
+            f"Дата: {report_date:%d.%m.%y}\n"
             "Проверь, что файлы ТО/чеки/длина 26 загружены и содержат эту дату."
         )
 
-    # Периоды MTD
+    # Период MTD
     mtd_start_26, mtd_end_26 = period_mtd(report_date)
-    mtd_start_25, mtd_end_25 = same_period_prev_year(mtd_start_26, mtd_end_26)
+    mtd_start_25 = pd.Timestamp(mtd_start_26.year - 1, mtd_start_26.month, mtd_start_26.day)
+    mtd_end_25 = pd.Timestamp(mtd_end_26.year - 1, mtd_end_26.month, mtd_end_26.day)
 
     # Метрики сети MTD (2026)
     net_mtd_26 = network_metrics(w26, mtd_start_26, mtd_end_26)
@@ -457,7 +464,7 @@ def build_report(report_date: datetime) -> str:
     lfl_checks = pct_change(ch26, ch25)
     lfl_avg = pct_change(avg26, avg25)
 
-    # ТОП/АНТИ-ТОП по LFL (лавки)
+    # ТОП/АНТИ-ТОП LFL (MTD): ТО / Чеки / Ср. чек
     lfl_store = pd.DataFrame(index=common)
     if common:
         lfl_store["TO"] = (s26_mtd.loc[common, "TO"] - s25_mtd.loc[common, "TO"]) / s25_mtd.loc[common, "TO"]
@@ -469,37 +476,54 @@ def build_report(report_date: datetime) -> str:
     top_checks, anti_checks = top_anti_3(lfl_store["CHECKS"]) if common else (pd.Series(dtype=float), pd.Series(dtype=float))
     top_avg, anti_avg = top_anti_3(lfl_store["AVG"]) if common else (pd.Series(dtype=float), pd.Series(dtype=float))
 
-    # Динамика "неделя к неделе" — неделя определяется введённой датой
-    iso = report_date.isocalendar()
-    iso_y = int(iso.year)
-    iso_w = int(iso.week)
-    prev_y, prev_w = iso_prev_week(iso_y, iso_w)
+    # Динамика неделя к неделе | Неделя W vs W-1 (по введённой дате)
+    cur_iso_year, cur_week = iso_week_year(report_date)
+    prev_iso_year, prev_week = prev_week_of(report_date)
 
-    wk26 = network_week(w26, iso_y, iso_w)
-    wk26_prev = network_week(w26, prev_y, prev_w)
+    wk26 = weekly_network(w26, cur_iso_year, cur_week)
+    wk26_prev = weekly_network(w26, prev_iso_year, prev_week)
 
-    w26_to = pct_change(wk26["to"], wk26_prev["to"])
-    w26_checks = pct_change(wk26["checks"], wk26_prev["checks"])
-    w26_avg = pct_change(wk26["avg"], wk26_prev["avg"])
+    wow26_to = pct_change(wk26["to"], wk26_prev["to"])
+    wow26_checks = pct_change(wk26["checks"], wk26_prev["checks"])
+    wow26_avg = pct_change(wk26["avg"], wk26_prev["avg"])
 
-    # 2025: тот же номер недели и предыдущая в 2025
-    wk25 = network_week(w25, iso_y - 1, iso_w)
-    wk25_prev = network_week(w25, prev_y - 1, prev_w)
+    # 2025: те же номера недель (cur_week vs prev_week) в 2025 году
+    wk25 = weekly_network(w25, cur_iso_year - 1, cur_week)
+    wk25_prev = weekly_network(w25, (prev_iso_year - 1), prev_week)
 
-    w25_to = pct_change(wk25["to"], wk25_prev["to"])
-    w25_checks = pct_change(wk25["checks"], wk25_prev["checks"])
-    w25_avg = pct_change(wk25["avg"], wk25_prev["avg"])
+    wow25_to = pct_change(wk25["to"], wk25_prev["to"])
+    wow25_checks = pct_change(wk25["checks"], wk25_prev["checks"])
+    wow25_avg = pct_change(wk25["avg"], wk25_prev["avg"])
 
-    # ====== СБОРКА ТЕКСТА ======
+    # ====== СБОРКА ТЕКСТА (как в эталоне) ======
     period_str = f"{mtd_start_26:%d.%m}–{mtd_end_26:%d.%m}"
+    report_date_str = f"{report_date:%d.%m.%y}"
+    week_header = f"Неделя {cur_week} vs {prev_week}"
+
+    # для красивого выравнивания в блоке РМ
+    rm_lines = []
+    max_name = 0
+    for _, r in rm_tbl.iterrows():
+        name = str(r["rm"]).strip()
+        max_name = max(max_name, len(name))
+        rm_lines.append((name, r["perf"]))
+    max_name = min(max_name, 28)  # чтобы не раздувало
+
+    def _store_label(code: str) -> str:
+        nm = store_name.get(code, "").strip()
+        if nm:
+            return f"{code} {nm}"
+        return code
 
     lines: List[str] = []
     lines.append(f"📊 <b>АНАЛИТИКА СЕТИ</b> | MTD ({period_str})")
+    lines.append(f"Дата отчёта: <b>{report_date_str}</b>")
+    lines.append("")
     lines.append(SEP)
     lines.append("")
     lines.append(f"ТО Факт:         <b>{fmt_money(net_mtd_26['to'])} ₽</b>")
     lines.append(f"ТО План на дату: <b>{fmt_money(plan_on_date_total)} ₽</b>")
-    lines.append(f"Выполнение:      <b>{fmt_pct(perf_net)}</b>")
+    lines.append(f"Выполнение плана: <b>{fmt_pct_plain(perf_net)}</b>")
     lines.append("")
     lines.append(f"Чеки:            <b>{fmt_money(net_mtd_26['checks'])}</b>")
     lines.append(f"Ср. чек:         <b>{fmt_money(net_mtd_26['avg'])} ₽</b>")
@@ -508,15 +532,18 @@ def build_report(report_date: datetime) -> str:
     lines.append(SEP)
     lines.append("👥 <b>РМ</b> | выполнение плана (MTD)")
     lines.append("")
-    for _, r in rm_tbl.iterrows():
-        rm_name = str(r["rm"]).strip()
-        lines.append(f"• {rm_name} — <b>{fmt_pct(r['perf'])}</b>")
+    for name, perf in rm_lines:
+        n = name[:max_name]
+        pad = " " * (max_name - len(n))
+        lines.append(f"{n}{pad} — <b>{fmt_pct_plain(perf)}</b>")
     lines.append("")
     lines.append(SEP)
     lines.append("📈 <b>LFL</b> | MTD (2026 vs 2025)")
     lines.append("")
     lines.append(
-        f"ТО: <b>{fmt_pct(lfl_to)}</b>   |   Чеки: <b>{fmt_pct(lfl_checks)}</b>   |   Ср. чек: <b>{fmt_pct(lfl_avg)}</b>"
+        f"ТО: <b>{fmt_pct_signed(lfl_to)}</b>   |   "
+        f"Чеки: <b>{fmt_pct_signed(lfl_checks)}</b>   |   "
+        f"Ср. чек: <b>{fmt_pct_signed(lfl_avg)}</b>"
     )
     lines.append("")
 
@@ -524,19 +551,19 @@ def build_report(report_date: datetime) -> str:
         lines.append(SEP)
         lines.append(title)
         lines.append("")
-        lines.append("<b>ТОП-3:</b>")
+        lines.append("ТОП-3:")
         if top_s is None or len(top_s) == 0:
             lines.append("—")
         else:
             for i, (k, v) in enumerate(top_s.items(), start=1):
-                lines.append(f"{i}) {k}  <b>{fmt_pct(v)}</b>")
+                lines.append(f"{i}) {_store_label(k)}  <b>{fmt_pct_signed(v)}</b>")
         lines.append("")
-        lines.append("<b>АНТИ-ТОП-3:</b>")
+        lines.append("АНТИ-ТОП-3:")
         if anti_s is None or len(anti_s) == 0:
             lines.append("—")
         else:
             for i, (k, v) in enumerate(anti_s.items(), start=1):
-                lines.append(f"{i}) {k}  <b>{fmt_pct(v)}</b>")
+                lines.append(f"{i}) {_store_label(k)}  <b>{fmt_pct_signed(v)}</b>")
         lines.append("")
 
     render_top_anti_block("📊 <b>ТОП / АНТИ-ТОП LFL (MTD) — ТО</b>", top_to, anti_to)
@@ -544,18 +571,37 @@ def build_report(report_date: datetime) -> str:
     render_top_anti_block("📊 <b>ТОП / АНТИ-ТОП LFL (MTD) — Ср. чек</b>", top_avg, anti_avg)
 
     lines.append(SEP)
-    lines.append("📊 <b>ДИНАМИКА НЕДЕЛЯ К НЕДЕЛЕ</b>")
+    lines.append(f"📊 <b>ДИНАМИКА НЕДЕЛЯ К НЕДЕЛЕ</b> | {week_header}")
     lines.append("")
     lines.append("<b>2026:</b>")
     lines.append(
-        f"ТО: <b>{fmt_pct(w26_to)}</b>   |   Чеки: <b>{fmt_pct(w26_checks)}</b>   |   Ср. чек: <b>{fmt_pct(w26_avg)}</b>"
+        f"ТО: <b>{fmt_pct_signed(wow26_to)}</b>   |   "
+        f"Чеки: <b>{fmt_pct_signed(wow26_checks)}</b>   |   "
+        f"Ср. чек: <b>{fmt_pct_signed(wow26_avg)}</b>"
     )
     lines.append("")
     lines.append("<b>2025:</b>")
     lines.append(
-        f"ТО: <b>{fmt_pct(w25_to)}</b>   |   Чеки: <b>{fmt_pct(w25_checks)}</b>   |   Ср. чек: <b>{fmt_pct(w25_avg)}</b>"
+        f"ТО: <b>{fmt_pct_signed(wow25_to)}</b>   |   "
+        f"Чеки: <b>{fmt_pct_signed(wow25_checks)}</b>   |   "
+        f"Ср. чек: <b>{fmt_pct_signed(wow25_avg)}</b>"
     )
     lines.append("")
+    lines.append(SEP)
+    lines.append("🧠 <b>ВЫВОДЫ</b>")
+    lines.append("")
+    lines.append(
+        f"1) LFL MTD: ТО {fmt_pct_signed(lfl_to)}, Чеки {fmt_pct_signed(lfl_checks)}, Ср. чек {fmt_pct_signed(lfl_avg)} — баланс трафика и среднего чека."
+    )
+    lines.append(
+        f"2) Выполнение плана по сети: {fmt_pct_plain(perf_net)} (план на дату) — при текущем темпе возможен риск недобора."
+    )
+    lines.append(
+        "3) Фокус — лавки АНТИ-ТОП-3 по LFL: они дают непропорционально большой минус сети."
+    )
+    lines.append(
+        f"4) Динамика неделя к неделе ({week_header}): 2026 (ТО {fmt_pct_signed(wow26_to)}, Чеки {fmt_pct_signed(wow26_checks)}, Ср. чек {fmt_pct_signed(wow26_avg)}) vs 2025 (ТО {fmt_pct_signed(wow25_to)}, Чеки {fmt_pct_signed(wow25_checks)}, Ср. чек {fmt_pct_signed(wow25_avg)})."
+    )
 
     return "\n".join(lines)
 
@@ -572,7 +618,7 @@ def cmd_start(m):
         "Загрузи Excel-файлы (как документы), потом вызови /report.\n\n"
         "Команды:\n"
         "• /files — что загружено\n"
-        "• /report — запросить дату и сформировать отчёт"
+        "• /report — сформировать отчёт"
     )
 
 
@@ -591,7 +637,7 @@ def cmd_report(m):
     bot.send_message(
         m.chat.id,
         "Введи дату для анализа в формате <b>DD.MM.YY</b>\n"
-        "Пример: <b>27.01.26</b>"
+        "Пример: <b>31.01.26</b>"
     )
 
 
@@ -609,8 +655,7 @@ def on_document(m):
             "• чеки 25 / чеки 26\n"
             "• длина 26\n"
             "• планы\n"
-            "• ростер\n\n"
-            "Файлы 'ср чек' можно не грузить — ср. чек считаю как ТО/Чеки."
+            "• ростер"
         )
         return
 
@@ -637,7 +682,7 @@ def on_text(m):
             bot.send_message(
                 m.chat.id,
                 "❌ Неверный формат даты.\n"
-                "Введи дату в формате <b>DD.MM.YY</b>, например <b>27.01.26</b>."
+                "Введи дату в формате <b>DD.MM.YY</b>, например <b>31.01.26</b>."
             )
             return
 
