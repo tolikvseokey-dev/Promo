@@ -476,6 +476,12 @@ def build_report(report_date: datetime) -> str:
     top_checks, anti_checks = top_anti_3(lfl_store["CHECKS"]) if common else (pd.Series(dtype=float), pd.Series(dtype=float))
     top_avg, anti_avg = top_anti_3(lfl_store["AVG"]) if common else (pd.Series(dtype=float), pd.Series(dtype=float))
 
+    # Сколько лавок в плюсе/минусе по LFL Чекам (MTD)
+    pos_checks = int((lfl_store["CHECKS"] > 0).sum()) if common else 0
+    neg_checks = int((lfl_store["CHECKS"] < 0).sum()) if common else 0
+    total_lfl_stores = int(lfl_store["CHECKS"].dropna().shape[0]) if common else 0
+
+
     # Динамика неделя к неделе | Неделя W vs W-1 (по введённой дате)
     cur_iso_year, cur_week = iso_week_year(report_date)
     prev_iso_year, prev_week = prev_week_of(report_date)
@@ -602,6 +608,10 @@ def build_report(report_date: datetime) -> str:
     lines.append(
         f"4) Динамика неделя к неделе ({week_header}): 2026 (ТО {fmt_pct_signed(wow26_to)}, Чеки {fmt_pct_signed(wow26_checks)}, Ср. чек {fmt_pct_signed(wow26_avg)}) vs 2025 (ТО {fmt_pct_signed(wow25_to)}, Чеки {fmt_pct_signed(wow25_checks)}, Ср. чек {fmt_pct_signed(wow25_avg)})."
     )
+    lines.append(
+        f"5) LFL по чекам: в плюсе {pos_checks} лавок, в минусе {neg_checks} лавок (база LFL: {total_lfl_stores})."
+    )
+
 
     return "\n".join(lines)
 
@@ -703,4 +713,3 @@ def on_text(m):
 if __name__ == "__main__":
     print("Bot is running...")
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
-
