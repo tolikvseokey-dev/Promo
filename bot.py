@@ -8,6 +8,7 @@ from typing import Dict, Tuple, Optional, List
 import numpy as np
 import pandas as pd
 import telebot
+from telebot import types
 
 
 # =========================
