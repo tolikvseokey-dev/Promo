@@ -12,6 +12,8 @@ import telebot
 # =========================
 # НАСТРОЙКИ
 # =========================
+BOT_VERSION = "analytics-bot-2026-02-06-02"
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     BOT_TOKEN = "PASTE_YOUR_TOKEN_HERE"  # лучше через переменную окружения
@@ -29,6 +31,23 @@ WAITING_FOR_REPORT_DATE: Dict[int, bool] = {}
 # УТИЛИТЫ / ФОРМАТЫ
 # =========================
 SEP = "━━━━━━━━━━━━━━━━━━━━━━"
+
+def send_long(chat_id: int, text: str):
+    """Отправка длинных сообщений частями (лимит Telegram ~4096 символов)."""
+    if not text:
+        return
+    limit = 3900
+    chunks = []
+    t = text
+    while len(t) > limit:
+        cut = t.rfind("\n", 0, limit)
+        if cut < 500:
+            cut = limit
+        chunks.append(t[:cut])
+        t = t[cut:].lstrip("\n")
+    chunks.append(t)
+    for c in chunks:
+        bot.send_message(chat_id, c)
 
 
 def _safe_num(x) -> float:
@@ -452,9 +471,7 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
     ]
     missing = [p for p in required if not os.path.exists(p)]
     if missing:
-        return (\"❌ Не хватает файлов:
-\" + \"
-\".join([f\"• {os.path.basename(x)}\" for x in missing]), None)
+        return ("❌ Не хватает файлов:\n" + "\n".join([f"• {os.path.basename(x)}" for x in missing]), None)
 
     store_rm, store_name = load_roster_maps(path_for("roster", 0))
 
@@ -624,7 +641,7 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
     extra_lines.append(f"Исключено: <b>{len(excluded_lfl)}</b> лавок")
     extra_lines.append(f"LFL база: <b>{len(common)}</b> лавок")
     extra_lines.append("")
-    extra_lines.append(f"<b>База лавок | Неделя к неделе</b> ({week_header}):")
+    extra_lines.append(f"<b>База лавок | Неделя к неделе</b> (Неделя {cur_week} vs {prev_week}):")
     extra_lines.append(f"2026: <b>{wk26_stores}</b> (нед.{cur_week}) / <b>{wk26_prev_stores}</b> (нед.{prev_week})")
     extra_lines.append(f"2025: <b>{wk25_stores}</b> (нед.{cur_week}) / <b>{wk25_prev_stores}</b> (нед.{prev_week})")
     extra_text = "\n".join(extra_lines)
@@ -757,8 +774,14 @@ def cmd_start(m):
         "Загрузи Excel-файлы (как документы), потом вызови /report.\n\n"
         "Команды:\n"
         "• /files — что загружено\n"
-        "• /report — сформировать отчёт"
+        "• /report — сформировать отчёт\n"
+        "• /version — версия бота"
     )
+
+
+@bot.message_handler(commands=["version"])
+def cmd_version(m):
+    bot.send_message(m.chat.id, f"BOT_VERSION: <b>{BOT_VERSION}</b>")
 
 
 @bot.message_handler(commands=["files"])
@@ -775,8 +798,8 @@ def cmd_report(m):
     WAITING_FOR_REPORT_DATE[m.chat.id] = True
     bot.send_message(
         m.chat.id,
-        "Введи дату для анализа в формате <b>DD.MM.YY</b>\n"
-        "Пример: <b>31.01.26</b>"
+        "Введи дату для анализа (поддерживаются разные форматы)\n"
+        "Примеры: <b>31.01.26</b>, <b>310126</b>, <b>31/01/26</b>, <b>31-01-26</b>"
     )
 
 
@@ -821,7 +844,7 @@ def on_text(m):
             bot.send_message(
                 m.chat.id,
                 "❌ Неверный формат даты.\n"
-                "Введи дату в формате <b>DD.MM.YY</b>, например <b>31.01.26</b>."
+                "Примеры: <b>31.01.26</b> или <b>310126</b> или <b>31/01/26</b>."
             )
             return
 
@@ -831,9 +854,9 @@ def on_text(m):
             main_text, extra_text = (f"❌ Ошибка при расчёте: {e}", None)
 
         WAITING_FOR_REPORT_DATE[m.chat.id] = False
-        bot.send_message(m.chat.id, main_text)
+        send_long(m.chat.id, main_text)
         if extra_text:
-            bot.send_message(m.chat.id, extra_text)
+            send_long(m.chat.id, extra_text)
         return
 
     if m.text.strip().startswith("/"):
@@ -844,4 +867,3 @@ def on_text(m):
 if __name__ == "__main__":
     print("Bot is running...")
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
-
