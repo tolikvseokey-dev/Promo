@@ -452,9 +452,7 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
     ]
     missing = [p for p in required if not os.path.exists(p)]
     if missing:
-        return (\"❌ Не хватает файлов:
-\" + \"
-\".join([f\"• {os.path.basename(x)}\" for x in missing]), None)
+        return ("❌ Не хватает файлов:\n" + "\n".join([f"• {os.path.basename(x)}" for x in missing]), None)
 
     store_rm, store_name = load_roster_maps(path_for("roster", 0))
 
