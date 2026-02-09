@@ -631,7 +631,6 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
     # ====== СБОРКА ТЕКСТА (как в эталоне) ======
     period_str = f"{mtd_start_26:%d.%m}–{mtd_end_26:%d.%m}"
     report_date_str = f"{report_date:%d.%m.%y}"
-    week_header = f"Неделя {cur_week} vs {prev_week}"
 
     # для красивого выравнивания в блоке РМ
     rm_lines = []
@@ -790,17 +789,23 @@ def on_document(m):
             "Назови файл так, чтобы было видно что это:\n"
             "• ТО 25 / ТО 26\n"
             "• чеки 25 / чеки 26\n"
-            "• длина 26\n"
+            "• длина 25 / длина 26\n"
+            "• ср чек 25 / ср чек 26\n"
             "• планы\n"
             "• ростер"
         )
         return
 
-    save_path = path_for(kind, year)
+    # ✅ ПЛАНЫ: сначала выбираем месяц, только потом сохраняем версию
+    if kind == "plans":
+        PENDING_PLAN_UPLOAD[m.chat.id] = {"file_id": doc.file_id, "file_name": doc.file_name}
+        kb = build_month_keyboard(datetime.now(), months_back=12)
+        bot.send_message(m.chat.id, "📅 Укажи, к какому месяцу относится этот план:", reply_markup=kb)
+        return
 
+    save_path = path_for(kind, year)
     file_info = bot.get_file(doc.file_id)
     downloaded = bot.download_file(file_info.file_path)
-
     with open(save_path, "wb") as f:
         f.write(downloaded)
 
@@ -809,7 +814,6 @@ def on_document(m):
         f"✅ Сохранила: <b>{os.path.basename(save_path)}</b>\n"
         f"Тип: <b>{kind.upper()}</b>  Год: <b>{year if year else '—'}</b>"
     )
-
 
 @bot.message_handler(func=lambda msg: True, content_types=["text"])
 def on_text(m):
