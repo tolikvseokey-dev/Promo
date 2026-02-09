@@ -2,13 +2,11 @@ import os
 import re
 import calendar
 from datetime import datetime, timedelta
-from dateutil.relativedelta import relativedelta
 from typing import Dict, Tuple, Optional, List
 
 import numpy as np
 import pandas as pd
 import telebot
-from telebot import types
 
 
 # =========================
@@ -126,90 +124,6 @@ def parse_input_date(text: str) -> Optional[datetime]:
     """
     if text is None:
         return None
-
-def month_key(dt: datetime) -> str:
-    return f"{dt.year:04d}-{dt.month:02d}"
-
-
-def month_label(year: int, month: int) -> str:
-    ru = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
-    return f"{ru[month-1]} {year}"
-
-
-def build_month_keyboard(base_dt: datetime, months_back: int = 12) -> types.InlineKeyboardMarkup:
-    """
-    Клавиатура выбора месяца плана: последние N месяцев, включая текущий.
-    """
-    kb = types.InlineKeyboardMarkup(row_width=3)
-    cur = datetime(base_dt.year, base_dt.month, 1)
-    buttons = []
-    for i in range(months_back):
-        mdt = cur - relativedelta(months=i)
-        key = f"{mdt.year:04d}-{mdt.month:02d}"
-        buttons.append(types.InlineKeyboardButton(text=month_label(mdt.year, mdt.month), callback_data=f"plan_month:{key}"))
-    kb.add(*buttons)
-    return kb
-
-
-def parse_plan_upload_ts(filename: str) -> Optional[datetime]:
-    m = re.search(r"uploaded_(\d{8})-(\d{6})", filename)
-    if not m:
-        return None
-    d, tt = m.group(1), m.group(2)
-    try:
-        return datetime.strptime(d + tt, "%Y%m%d%H%M%S")
-    except Exception:
-        return None
-
-
-def get_plan_file_for_date(report_date: datetime) -> Optional[str]:
-    """
-    Выбор файла планов по месяцу отчёта.
-    - берём последнюю версию, загруженную ДО/В день отчёта (до 23:59:59)
-    - если таких нет, берём самую последнюю в месяце
-    - если архив пуст, используем legacy data/plans.xlsx (если есть)
-    """
-    key = month_key(report_date)
-    month_dir = os.path.join(PLANS_DIR, key)
-    cutoff = datetime(report_date.year, report_date.month, report_date.day, 23, 59, 59)
-
-    candidates = []
-    if os.path.isdir(month_dir):
-        for fn in os.listdir(month_dir):
-            if fn.lower().endswith(".xlsx"):
-                full = os.path.join(month_dir, fn)
-                ts = parse_plan_upload_ts(fn) or datetime.fromtimestamp(os.path.getmtime(full))
-                candidates.append((ts, full))
-
-    if candidates:
-        le = [c for c in candidates if c[0] <= cutoff]
-        if le:
-            return sorted(le, key=lambda x: x[0])[-1][1]
-        return sorted(candidates, key=lambda x: x[0])[-1][1]
-
-    legacy = path_for("plans", 0)
-    if os.path.exists(legacy):
-        return legacy
-    return None
-
-
-def save_plan_version(month_key_str: str, file_id: str, orig_name: str) -> str:
-    """
-    Сохраняет загруженный файл планов как версию для выбранного месяца.
-    """
-    month_dir = os.path.join(PLANS_DIR, month_key_str)
-    os.makedirs(month_dir, exist_ok=True)
-
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    out_name = f"plans_{month_key_str}_uploaded_{ts}.xlsx"
-    out_path = os.path.join(month_dir, out_name)
-
-    file_info = bot.get_file(file_id)
-    downloaded = bot.download_file(file_info.file_path)
-    with open(out_path, "wb") as f:
-        f.write(downloaded)
-    return out_path
-
 
     t = str(text).strip()
 
@@ -529,6 +443,7 @@ def weekly_network(w: pd.DataFrame, iso_year: int, iso_week: int) -> Dict[str, f
 def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
     required = [
         path_for("roster", 0),
+        path_for("plans", 0),
         path_for("to", 25),
         path_for("checks", 25),
         path_for("to", 26),
@@ -537,7 +452,9 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
     ]
     missing = [p for p in required if not os.path.exists(p)]
     if missing:
-        return ("❌ Не хватает файлов:\n" + "\n".join([f"• {os.path.basename(x)}" for x in missing]), None)
+        return (\"❌ Не хватает файлов:
+\" + \"
+\".join([f\"• {os.path.basename(x)}\" for x in missing]), None)
 
     store_rm, store_name = load_roster_maps(path_for("roster", 0))
 
@@ -583,12 +500,7 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
     net_mtd_26 = network_metrics(w26, mtd_start_26, mtd_end_26)
 
     # Планы + план на дату + выполнение
-
-    plans_path = get_plan_file_for_date(report_date)
-    if not plans_path:
-        return ("❌ Не найден файл планов. Загрузи планы и выбери месяц.", None)
-    plans = read_plans(plans_path, store_rm)
-
+    plans = read_plans(path_for("plans", 0), store_rm)
 
     stores_in_mtd = set(
         w26[(w26["date"] >= mtd_start_26) & (w26["date"] <= mtd_end_26)]["store_code"].unique()
@@ -932,3 +844,4 @@ def on_text(m):
 if __name__ == "__main__":
     print("Bot is running...")
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
+
