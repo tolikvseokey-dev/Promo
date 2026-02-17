@@ -7,12 +7,13 @@ from typing import Dict, Tuple, Optional, List
 import numpy as np
 import pandas as pd
 import telebot
+from telebot import types
 
 
 # =========================
 # НАСТРОЙКИ
 # =========================
-BOT_VERSION = "analytics-bot-2026-02-06-02-top5"
+BOT_VERSION = "analytics-bot-2026-02-17-modeA-top5-rm-no-tops"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
@@ -23,8 +24,11 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# Состояние: ждём дату после /report
-WAITING_FOR_REPORT_DATE: Dict[int, bool] = {}
+# Состояния
+WAITING_FOR_REPORT_DATE: Dict[int, bool] = {}     # ждём дату
+REPORT_MODE: Dict[int, str] = {}                  # "network" | "rm"
+SELECTED_RM: Dict[int, Optional[str]] = {}        # выбранный РМ для режима rm
+RM_OPTIONS: Dict[int, List[str]] = {}             # список РМ для кнопок выбора (по chat_id)
 
 
 # =========================
@@ -37,17 +41,15 @@ def send_long(chat_id: int, text: str):
     if not text:
         return
     limit = 3900
-    chunks = []
     t = text
     while len(t) > limit:
         cut = t.rfind("\n", 0, limit)
         if cut < 500:
             cut = limit
-        chunks.append(t[:cut])
+        bot.send_message(chat_id, t[:cut])
         t = t[cut:].lstrip("\n")
-    chunks.append(t)
-    for c in chunks:
-        bot.send_message(chat_id, c)
+    if t:
+        bot.send_message(chat_id, t)
 
 
 def _safe_num(x) -> float:
@@ -128,9 +130,9 @@ def parse_input_date(text: str) -> Optional[datetime]:
     Принимаем разные форматы даты, например:
     - 310126
     - 31.01.26
-    - 31\01\26
+    - 31\\01\\26
     - 31/01/26
-    - 31ю01ю26 (частая ошибка раскладки/клавиатуры)
+    - 31ю01ю26
     - 31,01,26
     - 31-01-26
     - 31 01 26
@@ -143,12 +145,10 @@ def parse_input_date(text: str) -> Optional[datetime]:
 
     t = str(text).strip()
 
-    # Частые "разделители-ошибки" приводим к пробелу, чтобы digits-группы читались стабильно
     t = t.replace("ю", ".").replace("Ю", ".")
     t = t.replace("\\", ".").replace("/", ".").replace(",", ".").replace("-", ".").replace("_", ".")
     t = re.sub(r"\s+", " ", t).strip()
 
-    # 1) Попытка: если только цифры (включая пробелы) — соберём их в одну строку
     digits_only = re.sub(r"\D", "", t)
 
     def _make(dd: int, mm: int, yyyy: int) -> Optional[datetime]:
@@ -157,15 +157,13 @@ def parse_input_date(text: str) -> Optional[datetime]:
         except ValueError:
             return None
 
-    # ddmmyy (6 цифр)
-    if len(digits_only) == 6:
+    if len(digits_only) == 6:  # ddmmyy
         dd = int(digits_only[0:2])
         mm = int(digits_only[2:4])
         yy = int(digits_only[4:6])
         return _make(dd, mm, 2000 + yy)
 
-    # ddmmyyyy (8 цифр)
-    if len(digits_only) == 8:
+    if len(digits_only) == 8:  # ddmmyyyy
         dd = int(digits_only[0:2])
         mm = int(digits_only[2:4])
         yyyy = int(digits_only[4:8])
@@ -173,7 +171,6 @@ def parse_input_date(text: str) -> Optional[datetime]:
             return _make(dd, mm, yyyy)
         return None
 
-    # 2) Попытка: группы цифр (через любые разделители)
     parts = re.findall(r"\d+", t)
     if len(parts) >= 3:
         dd = int(parts[0])
@@ -248,7 +245,6 @@ def path_for(kind: str, year: int) -> str:
 # =========================
 def read_metric_file(path: str, metric: str) -> pd.DataFrame:
     """
-    Метрики НЕ читаем по названиям столбцов.
     Берём первые 4 столбца:
     1) РМ, 2) Торговые точки, 3) значение, 4) дата
     """
@@ -329,7 +325,6 @@ def make_wide(df: pd.DataFrame) -> pd.DataFrame:
 
 def read_plans(plans_path: str, store_rm: Dict[str, str]) -> pd.DataFrame:
     """
-    План — шапка может быть не в первой строке (например, сверху "Примененные фильтры").
     Ищем строку, где одновременно есть 'торговые точки' и 'план', и используем её как header.
     """
     raw = pd.read_excel(plans_path, header=None)
@@ -422,9 +417,9 @@ def weekly_network(w: pd.DataFrame, iso_year: int, iso_week: int) -> Dict[str, f
 
 
 # =========================
-# СБОРКА ОТЧЁТА (ЭТАЛОН)
+# СБОРКА ОТЧЁТА
 # =========================
-def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
+def build_report(report_date: datetime, rm_filter: Optional[str] = None) -> Tuple[str, Optional[str]]:
     required = [
         path_for("roster", 0),
         path_for("plans", 0),
@@ -436,7 +431,8 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
     ]
     missing = [p for p in required if not os.path.exists(p)]
     if missing:
-        return ("❌ Не хватает файлов:\n" + "\n".join([f"• {os.path.basename(x)}" for x in missing]), None)
+        msg = "❌ Не хватает файлов:\n" + "\n".join([f"• {os.path.basename(x)}" for x in missing])
+        return (msg, None)
 
     store_rm, store_name = load_roster_maps(path_for("roster", 0))
 
@@ -463,31 +459,42 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
     df25 = attach_rm(df25, store_rm)
     w25 = make_wide(df25)
 
+    # ФИЛЬТР ПО РМ (режим "По РМ")
+    if rm_filter:
+        w26 = w26[w26["rm"].astype(str).str.strip() == str(rm_filter).strip()].copy()
+        w25 = w25[w25["rm"].astype(str).str.strip() == str(rm_filter).strip()].copy()
+
     report_ts = pd.Timestamp(report_date.year, report_date.month, report_date.day)
 
-    # Проверка: введённая дата должна быть в данных 2026
+    # Проверка: введённая дата должна быть в данных 2026 (в выбранном режиме)
     if w26[w26["date"] == report_ts].empty:
-        return (
+        scope = f"для РМ: {rm_filter}" if rm_filter else "по сети"
+        msg = (
             "❌ В данных 2026 нет записей за введённую дату.\n"
+            f"Контур: {scope}\n"
             f"Дата: {report_date:%d.%m.%y}\n"
             "Проверь, что файлы ТО/чеки/длина 26 загружены и содержат эту дату."
-        ), None
+        )
+        return (msg, None)
 
     # Период MTD
     mtd_start_26, mtd_end_26 = period_mtd(report_date)
     mtd_start_25 = pd.Timestamp(mtd_start_26.year - 1, mtd_start_26.month, mtd_start_26.day)
     mtd_end_25 = pd.Timestamp(mtd_end_26.year - 1, mtd_end_26.month, mtd_end_26.day)
 
-    # Метрики сети MTD (2026)
+    # Метрики MTD (в выбранном контуре)
     net_mtd_26 = network_metrics(w26, mtd_start_26, mtd_end_26)
 
-    # Планы + план на дату + выполнение
+    # Планы + план на дату + выполнение (в выбранном контуре)
     plans = read_plans(path_for("plans", 0), store_rm)
 
     stores_in_mtd = set(
         w26[(w26["date"] >= mtd_start_26) & (w26["date"] <= mtd_end_26)]["store_code"].unique()
     )
     plans_used = plans[plans["store_code"].isin(stores_in_mtd)].copy()
+
+    if rm_filter:
+        plans_used = plans_used[plans_used["rm"].astype(str).str.strip() == str(rm_filter).strip()].copy()
 
     month_plan_total = float(np.nansum(plans_used["month_plan"]))
     plan_on_date_total = plan_to_date(month_plan_total, report_date)
@@ -497,14 +504,17 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
         else np.nan
     )
 
-    # РМ — ВСЕ (из ростера + планов + факта)
-    rms_from_roster = {v for v in store_rm.values() if v and str(v).strip()}
-    rms_from_plans = {str(x).strip() for x in plans_used["rm"].dropna().astype(str).tolist()}
-    rms_from_fact = {
-        str(x).strip()
-        for x in w26[(w26["date"] >= mtd_start_26) & (w26["date"] <= mtd_end_26)]["rm"].dropna().astype(str).tolist()
-    }
-    all_rms = sorted({*rms_from_roster, *rms_from_plans, *rms_from_fact})
+    # РМ-таблица (для сети: все, для РМ: одна строка)
+    if not rm_filter:
+        rms_from_roster = {v for v in store_rm.values() if v and str(v).strip()}
+        rms_from_plans = {str(x).strip() for x in plans_used["rm"].dropna().astype(str).tolist()}
+        rms_from_fact = {
+            str(x).strip()
+            for x in w26[(w26["date"] >= mtd_start_26) & (w26["date"] <= mtd_end_26)]["rm"].dropna().astype(str).tolist()
+        }
+        all_rms = sorted({*rms_from_roster, *rms_from_plans, *rms_from_fact})
+    else:
+        all_rms = [str(rm_filter).strip()]
 
     fact_by_rm = (
         w26[(w26["date"] >= mtd_start_26) & (w26["date"] <= mtd_end_26)]
@@ -537,7 +547,10 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
     lfl_checks = pct_change(ch26, ch25)
     lfl_avg = pct_change(avg26, avg25)
 
-    # ТОП/АНТИ-ТОП LFL (MTD): ТО / Чеки / Ср. чек
+    # Только для сети считаем ТОП/АНТИ-ТОП (для РМ — убираем полностью)
+    TOP_N = 5
+    top_to = anti_to = top_checks = anti_checks = top_avg = anti_avg = pd.Series(dtype=float)
+
     lfl_store = pd.DataFrame(index=common)
     if common:
         lfl_store["TO"] = (s26_mtd.loc[common, "TO"] - s25_mtd.loc[common, "TO"]) / s25_mtd.loc[common, "TO"]
@@ -545,10 +558,10 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
         lfl_store["AVG"] = (s26_mtd.loc[common, "AVG"] - s25_mtd.loc[common, "AVG"]) / s25_mtd.loc[common, "AVG"]
         lfl_store = lfl_store.replace([np.inf, -np.inf], np.nan)
 
-    TOP_N = 5
-    top_to, anti_to = top_anti_n(lfl_store["TO"], TOP_N) if common else (pd.Series(dtype=float), pd.Series(dtype=float))
-    top_checks, anti_checks = top_anti_n(lfl_store["CHECKS"], TOP_N) if common else (pd.Series(dtype=float), pd.Series(dtype=float))
-    top_avg, anti_avg = top_anti_n(lfl_store["AVG"], TOP_N) if common else (pd.Series(dtype=float), pd.Series(dtype=float))
+    if (not rm_filter) and common:
+        top_to, anti_to = top_anti_n(lfl_store["TO"], TOP_N)
+        top_checks, anti_checks = top_anti_n(lfl_store["CHECKS"], TOP_N)
+        top_avg, anti_avg = top_anti_n(lfl_store["AVG"], TOP_N)
 
     # Сколько лавок в плюсе/минусе по LFL Чекам (MTD)
     pos_checks = int((lfl_store["CHECKS"] > 0).sum()) if common else 0
@@ -566,7 +579,6 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
     wow26_checks = pct_change(wk26["checks"], wk26_prev["checks"])
     wow26_avg = pct_change(wk26["avg"], wk26_prev["avg"])
 
-    # 2025: те же номера недель (cur_week vs prev_week) в 2025 году
     wk25 = weekly_network(w25, cur_iso_year - 1, cur_week)
     wk25_prev = weekly_network(w25, (prev_iso_year - 1), prev_week)
 
@@ -575,20 +587,20 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
     wow25_avg = pct_change(wk25["avg"], wk25_prev["avg"])
 
     # =========================
-    # СЛУЖЕБНОЕ СООБЩЕНИЕ (отдельным сообщением)
+    # СЛУЖЕБНОЕ СООБЩЕНИЕ
     # =========================
     stores26_mtd = set(s26_mtd.index.astype(str)) if not s26_mtd.empty else set()
     stores25_mtd = set(s25_mtd.index.astype(str)) if not s25_mtd.empty else set()
     excluded_lfl = sorted(list((stores26_mtd ^ stores25_mtd)))  # симм.разность
 
-    def _store_label_plain(code_: str) -> str:
-        nm_ = store_name.get(code_, "").strip()
-        return f"{code_} {nm_}".strip() if nm_ else code_
-
     wk26_stores = int(w26[(w26["iso_year"] == cur_iso_year) & (w26["iso_week"] == cur_week)]["store_code"].nunique())
     wk26_prev_stores = int(w26[(w26["iso_year"] == prev_iso_year) & (w26["iso_week"] == prev_week)]["store_code"].nunique())
     wk25_stores = int(w25[(w25["iso_year"] == (cur_iso_year - 1)) & (w25["iso_week"] == cur_week)]["store_code"].nunique())
     wk25_prev_stores = int(w25[(w25["iso_year"] == (prev_iso_year - 1)) & (w25["iso_week"] == prev_week)]["store_code"].nunique())
+
+    def _store_label_plain(code_: str) -> str:
+        nm_ = store_name.get(code_, "").strip()
+        return f"{code_} {nm_}".strip() if nm_ else code_
 
     extra_lines: List[str] = []
     extra_lines.append(SEP)
@@ -614,23 +626,17 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
     report_date_str = f"{report_date:%d.%m.%y}"
     week_header = f"Неделя {cur_week} vs {prev_week}"
 
-    # для красивого выравнивания в блоке РМ
-    rm_lines = []
-    max_name = 0
-    for _, r in rm_tbl.iterrows():
-        name = str(r["rm"]).strip()
-        max_name = max(max_name, len(name))
-        rm_lines.append((name, r["perf"]))
-    max_name = min(max_name, 28)
-
     def _store_label(code: str) -> str:
         nm = store_name.get(code, "").strip()
-        if nm:
-            return f"{code} {nm}"
-        return code
+        return f"{code} {nm}".strip() if nm else code
 
     lines: List[str] = []
-    lines.append(f"📊 <b>АНАЛИТИКА СЕТИ</b> | MTD ({period_str})")
+
+    if rm_filter:
+        lines.append(f"👥 <b>АНАЛИТИКА РМ:</b> <b>{rm_filter}</b> | MTD ({period_str})")
+    else:
+        lines.append(f"📊 <b>АНАЛИТИКА СЕТИ</b> | MTD ({period_str})")
+
     lines.append(f"Дата отчёта: <b>{report_date_str}</b>")
     lines.append("")
     lines.append(SEP)
@@ -646,10 +652,32 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
     lines.append(SEP)
     lines.append("👥 <b>РМ</b> | выполнение плана (MTD)")
     lines.append("")
-    for name, perf in rm_lines:
-        n = name[:max_name]
-        pad = " " * (max_name - len(n))
-        lines.append(f"{n}{pad} — <b>{fmt_pct_plain(perf)}</b>")
+
+    if not rm_filter:
+        # список всех РМ
+        rm_lines = []
+        max_name = 0
+        for _, r in rm_tbl.iterrows():
+            name = str(r["rm"]).strip()
+            max_name = max(max_name, len(name))
+            rm_lines.append((name, r["perf"]))
+        max_name = min(max_name, 28)
+
+        for name, perf in rm_lines:
+            n = name[:max_name]
+            pad = " " * (max_name - len(n))
+            lines.append(f"{n}{pad} — <b>{fmt_pct_plain(perf)}</b>")
+    else:
+        # 1 строка по выбранному РМ с ТО/план/вып
+        r = rm_tbl.iloc[0] if not rm_tbl.empty else None
+        rm_name = str(rm_filter).strip()
+        fact_rm = float(r["fact"]) if r is not None and not pd.isna(r["fact"]) else np.nan
+        plan_rm = float(r["plan_on_date"]) if r is not None and not pd.isna(r["plan_on_date"]) else np.nan
+        perf_rm = float(r["perf"]) if r is not None and not pd.isna(r["perf"]) else np.nan
+
+        lines.append(f"{rm_name}")
+        lines.append(f"ТО: <b>{fmt_money(fact_rm)} ₽</b>   |   План: <b>{fmt_money(plan_rm)} ₽</b>   |   Вып: <b>{fmt_pct_plain(perf_rm)}</b>")
+
     lines.append("")
     lines.append(SEP)
     lines.append("📈 <b>LFL</b> | MTD (2026 vs 2025)")
@@ -661,28 +689,30 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
     )
     lines.append("")
 
-    def render_top_anti_block(title: str, top_s: pd.Series, anti_s: pd.Series, n: int = 5):
-        lines.append(SEP)
-        lines.append(title)
-        lines.append("")
-        lines.append(f"ТОП-{n}:")
-        if top_s is None or len(top_s) == 0:
-            lines.append("—")
-        else:
-            for i, (k, v) in enumerate(top_s.items(), start=1):
-                lines.append(f"{i}) {_store_label(k)}  <b>{fmt_pct_signed(v)}</b>")
-        lines.append("")
-        lines.append(f"АНТИ-ТОП-{n}:")
-        if anti_s is None or len(anti_s) == 0:
-            lines.append("—")
-        else:
-            for i, (k, v) in enumerate(anti_s.items(), start=1):
-                lines.append(f"{i}) {_store_label(k)}  <b>{fmt_pct_signed(v)}</b>")
-        lines.append("")
+    # ТОП/АНТИ-ТОП — ТОЛЬКО В РЕЖИМЕ СЕТИ
+    if not rm_filter:
+        def render_top_anti_block(title: str, top_s: pd.Series, anti_s: pd.Series, n: int = 5):
+            lines.append(SEP)
+            lines.append(title)
+            lines.append("")
+            lines.append(f"ТОП-{n}:")
+            if top_s is None or len(top_s) == 0:
+                lines.append("—")
+            else:
+                for i, (k, v) in enumerate(top_s.items(), start=1):
+                    lines.append(f"{i}) {_store_label(k)}  <b>{fmt_pct_signed(v)}</b>")
+            lines.append("")
+            lines.append(f"АНТИ-ТОП-{n}:")
+            if anti_s is None or len(anti_s) == 0:
+                lines.append("—")
+            else:
+                for i, (k, v) in enumerate(anti_s.items(), start=1):
+                    lines.append(f"{i}) {_store_label(k)}  <b>{fmt_pct_signed(v)}</b>")
+            lines.append("")
 
-    render_top_anti_block("📊 <b>ТОП / АНТИ-ТОП LFL (MTD) — ТО</b>", top_to, anti_to, TOP_N)
-    render_top_anti_block("📊 <b>ТОП / АНТИ-ТОП LFL (MTD) — Чеки</b>", top_checks, anti_checks, TOP_N)
-    render_top_anti_block("📊 <b>ТОП / АНТИ-ТОП LFL (MTD) — Ср. чек</b>", top_avg, anti_avg, TOP_N)
+        render_top_anti_block("📊 <b>ТОП / АНТИ-ТОП LFL (MTD) — ТО</b>", top_to, anti_to, TOP_N)
+        render_top_anti_block("📊 <b>ТОП / АНТИ-ТОП LFL (MTD) — Чеки</b>", top_checks, anti_checks, TOP_N)
+        render_top_anti_block("📊 <b>ТОП / АНТИ-ТОП LFL (MTD) — Ср. чек</b>", top_avg, anti_avg, TOP_N)
 
     lines.append(SEP)
     lines.append(f"📊 <b>ДИНАМИКА НЕДЕЛЯ К НЕДЕЛЕ</b> | {week_header}")
@@ -708,17 +738,23 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
         f"1) LFL MTD: ТО {fmt_pct_signed(lfl_to)}, Чеки {fmt_pct_signed(lfl_checks)}, Ср. чек {fmt_pct_signed(lfl_avg)} — баланс трафика и среднего чека."
     )
     lines.append(
-        f"2) Выполнение плана по сети: {fmt_pct_plain(perf_net)} (план на дату) — при текущем темпе возможен риск недобора."
+        f"2) Выполнение плана: {fmt_pct_plain(perf_net)} (план на дату) — при текущем темпе возможен риск недобора."
     )
-    lines.append(
-        "3) Фокус — лавки АНТИ-ТОП по LFL: они дают непропорционально большой минус сети."
-    )
-    lines.append(
-        f"4) Динамика неделя к неделе ({week_header}): 2026 (ТО {fmt_pct_signed(wow26_to)}, Чеки {fmt_pct_signed(wow26_checks)}, Ср. чек {fmt_pct_signed(wow26_avg)}) vs 2025 (ТО {fmt_pct_signed(wow25_to)}, Чеки {fmt_pct_signed(wow25_checks)}, Ср. чек {fmt_pct_signed(wow25_avg)})."
-    )
-    lines.append(
-        f"5) LFL по чекам: в плюсе {pos_checks} лавок, в минусе {neg_checks} лавок (база LFL: {total_lfl_stores})."
-    )
+    if not rm_filter:
+        lines.append("3) Фокус — лавки АНТИ-ТОП по LFL: они дают непропорционально большой минус результата.")
+        lines.append(
+            f"4) Динамика неделя к неделе ({week_header}): 2026 (ТО {fmt_pct_signed(wow26_to)}, Чеки {fmt_pct_signed(wow26_checks)}, Ср. чек {fmt_pct_signed(wow26_avg)}) vs 2025 (ТО {fmt_pct_signed(wow25_to)}, Чеки {fmt_pct_signed(wow25_checks)}, Ср. чек {fmt_pct_signed(wow25_avg)})."
+        )
+        lines.append(
+            f"5) LFL по чекам: в плюсе {pos_checks} лавок, в минусе {neg_checks} лавок (база LFL: {total_lfl_stores})."
+        )
+    else:
+        lines.append(
+            f"3) Динамика неделя к неделе ({week_header}): 2026 (ТО {fmt_pct_signed(wow26_to)}, Чеки {fmt_pct_signed(wow26_checks)}, Ср. чек {fmt_pct_signed(wow26_avg)}) vs 2025 (ТО {fmt_pct_signed(wow25_to)}, Чеки {fmt_pct_signed(wow25_checks)}, Ср. чек {fmt_pct_signed(wow25_avg)})."
+        )
+        lines.append(
+            f"4) LFL по чекам: в плюсе {pos_checks} лавок, в минусе {neg_checks} лавок (база LFL: {total_lfl_stores})."
+        )
 
     return ("\n".join(lines), extra_text)
 
@@ -729,13 +765,16 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
 @bot.message_handler(commands=["start"])
 def cmd_start(m):
     WAITING_FOR_REPORT_DATE[m.chat.id] = False
+    REPORT_MODE[m.chat.id] = "network"
+    SELECTED_RM[m.chat.id] = None
+
     bot.send_message(
         m.chat.id,
-        "Привет! 👋\n"
+        "Привет! Я Лея 👋\n"
         "Загрузи Excel-файлы (как документы), потом вызови /report.\n\n"
         "Команды:\n"
         "• /files — что загружено\n"
-        "• /report — сформировать отчёт\n"
+        "• /report — выбрать режим и сформировать отчёт\n"
         "• /version — версия бота"
     )
 
@@ -756,12 +795,102 @@ def cmd_files(m):
 
 @bot.message_handler(commands=["report"])
 def cmd_report(m):
-    WAITING_FOR_REPORT_DATE[m.chat.id] = True
-    bot.send_message(
-        m.chat.id,
-        "Введи дату для анализа (поддерживаются разные форматы)\n"
-        "Примеры: <b>31.01.26</b>, <b>310126</b>, <b>31/01/26</b>, <b>31-01-26</b>"
+    WAITING_FOR_REPORT_DATE[m.chat.id] = False
+    SELECTED_RM[m.chat.id] = None
+
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("📊 По сети", callback_data="rep|network"),
+        types.InlineKeyboardButton("👥 По РМ", callback_data="rep|rm"),
     )
+    bot.send_message(m.chat.id, "Выбери тип отчёта:", reply_markup=kb)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("rep|"))
+def on_report_type(call):
+    try:
+        chat_id = call.message.chat.id
+        mode = call.data.split("|", 1)[1]
+
+        if mode == "network":
+            REPORT_MODE[chat_id] = "network"
+            SELECTED_RM[chat_id] = None
+            WAITING_FOR_REPORT_DATE[chat_id] = True
+            bot.answer_callback_query(call.id, "Режим: По сети")
+            bot.send_message(
+                chat_id,
+                "Введи дату для анализа (поддерживаются разные форматы)\n"
+                "Примеры: <b>31.01.26</b>, <b>310126</b>, <b>31/01/26</b>, <b>31-01-26</b>"
+            )
+            return
+
+        if mode == "rm":
+            REPORT_MODE[chat_id] = "rm"
+            SELECTED_RM[chat_id] = None
+            WAITING_FOR_REPORT_DATE[chat_id] = False
+
+            roster_path = path_for("roster", 0)
+            if not os.path.exists(roster_path):
+                bot.answer_callback_query(call.id, "Нет ростера")
+                bot.send_message(chat_id, "❌ Сначала загрузи файл <b>ростер</b>, чтобы я могла показать список РМ.")
+                return
+
+            store_rm, _ = load_roster_maps(roster_path)
+            rms = sorted({str(v).strip() for v in store_rm.values() if v and str(v).strip()})
+            if not rms:
+                bot.answer_callback_query(call.id, "РМ не найдены")
+                bot.send_message(chat_id, "❌ В ростере не нашла РМ (колонка 'Регион').")
+                return
+
+            RM_OPTIONS[chat_id] = rms
+
+            kb = types.InlineKeyboardMarkup(row_width=1)
+            for i, rm in enumerate(rms):
+                kb.add(types.InlineKeyboardButton(rm, callback_data=f"rm|{i}"))
+
+            bot.answer_callback_query(call.id, "Режим: По РМ")
+            bot.send_message(chat_id, "Выбери РМ:", reply_markup=kb)
+            return
+
+        bot.answer_callback_query(call.id, "Неизвестный режим")
+
+    except Exception as e:
+        try:
+            bot.answer_callback_query(call.id, "Ошибка")
+        except Exception:
+            pass
+        bot.send_message(call.message.chat.id, f"❌ Ошибка: {e}")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("rm|"))
+def on_rm_selected(call):
+    try:
+        chat_id = call.message.chat.id
+        idx = int(call.data.split("|", 1)[1])
+        rms = RM_OPTIONS.get(chat_id, [])
+        if idx < 0 or idx >= len(rms):
+            bot.answer_callback_query(call.id, "РМ не найден")
+            bot.send_message(chat_id, "❌ Не нашла выбранного РМ. Попробуй снова: /report")
+            return
+
+        SELECTED_RM[chat_id] = rms[idx]
+        REPORT_MODE[chat_id] = "rm"
+        WAITING_FOR_REPORT_DATE[chat_id] = True
+
+        bot.answer_callback_query(call.id, f"Выбран: {SELECTED_RM[chat_id]}")
+        bot.send_message(
+            chat_id,
+            f"Ок, РМ: <b>{SELECTED_RM[chat_id]}</b>\n\n"
+            "Введи дату для анализа (поддерживаются разные форматы)\n"
+            "Примеры: <b>31.01.26</b>, <b>310126</b>, <b>31/01/26</b>, <b>31-01-26</b>"
+        )
+
+    except Exception as e:
+        try:
+            bot.answer_callback_query(call.id, "Ошибка")
+        except Exception:
+            pass
+        bot.send_message(call.message.chat.id, f"❌ Ошибка: {e}")
 
 
 @bot.message_handler(content_types=["document"])
@@ -809,8 +938,16 @@ def on_text(m):
             )
             return
 
+        mode = REPORT_MODE.get(m.chat.id, "network")
+        rm_filter = SELECTED_RM.get(m.chat.id)
+
+        if mode == "rm" and not rm_filter:
+            WAITING_FOR_REPORT_DATE[m.chat.id] = False
+            bot.send_message(m.chat.id, "❌ Не выбран РМ. Напиши /report и выбери режим «По РМ».")
+            return
+
         try:
-            main_text, extra_text = build_report(dt)
+            main_text, extra_text = build_report(dt, rm_filter=rm_filter if mode == "rm" else None)
         except Exception as e:
             main_text, extra_text = (f"❌ Ошибка при расчёте: {e}", None)
 
