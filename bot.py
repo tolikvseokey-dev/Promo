@@ -12,7 +12,7 @@ import telebot
 # =========================
 # НАСТРОЙКИ
 # =========================
-BOT_VERSION = "analytics-bot-2026-02-06-02"
+BOT_VERSION = "analytics-bot-2026-02-06-02-top5"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
@@ -137,9 +137,6 @@ def parse_input_date(text: str) -> Optional[datetime]:
     - 31.1.26
     - 31.01.2026
     - 31012026
-    Логика:
-    - вытаскиваем группы цифр (dd, mm, yy|yyyy) или цельную строку из 6/8 цифр
-    - валидируем и собираем datetime
     """
     if text is None:
         return None
@@ -172,7 +169,6 @@ def parse_input_date(text: str) -> Optional[datetime]:
         dd = int(digits_only[0:2])
         mm = int(digits_only[2:4])
         yyyy = int(digits_only[4:8])
-        # если вдруг ввели 0000/0026 и т.п. — отсекаем
         if 1900 <= yyyy <= 2100:
             return _make(dd, mm, yyyy)
         return None
@@ -184,7 +180,6 @@ def parse_input_date(text: str) -> Optional[datetime]:
         mm = int(parts[1])
         yy_or_yyyy = parts[2]
 
-        # иногда хвостом прилетает время "31.01.26 12:00" — игнорируем лишнее
         if len(yy_or_yyyy) == 2:
             yyyy = 2000 + int(yy_or_yyyy)
         elif len(yy_or_yyyy) == 4:
@@ -197,36 +192,6 @@ def parse_input_date(text: str) -> Optional[datetime]:
         return _make(dd, mm, yyyy)
 
     return None
-
-    t = text.strip().lower()
-
-    # заменить любые нецифры на точку
-    t = re.sub(r"[^0-9]", ".", t)
-    t = re.sub(r"\.+", ".", t).strip(".")
-
-    parts = t.split(".")
-
-    try:
-        if len(parts) == 1 and len(parts[0]) == 6:
-            # формат 310126
-            dd = int(parts[0][0:2])
-            mm = int(parts[0][2:4])
-            yy = int(parts[0][4:6])
-        elif len(parts) == 3:
-            dd, mm, yy = map(int, parts)
-        else:
-            return None
-
-        yyyy = 2000 + yy if yy < 100 else yy
-        return datetime(yyyy, mm, dd)
-    except Exception:
-        return None
-    dd, mm, yy = map(int, m.groups())
-    yyyy = 2000 + yy
-    try:
-        return datetime(yyyy, mm, dd)
-    except ValueError:
-        return None
 
 
 def iso_week_year(d: datetime) -> Tuple[int, int]:
@@ -441,10 +406,10 @@ def per_store_period(w: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) ->
     return g
 
 
-def top_anti_3(series: pd.Series) -> Tuple[pd.Series, pd.Series]:
+def top_anti_n(series: pd.Series, n: int = 5) -> Tuple[pd.Series, pd.Series]:
     s = series.replace([np.inf, -np.inf], np.nan).dropna()
-    top = s.sort_values(ascending=False).head(3)
-    anti = s.sort_values(ascending=True).head(3)
+    top = s.sort_values(ascending=False).head(n)
+    anti = s.sort_values(ascending=True).head(n)
     return top, anti
 
 
@@ -506,7 +471,7 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
             "❌ В данных 2026 нет записей за введённую дату.\n"
             f"Дата: {report_date:%d.%m.%y}\n"
             "Проверь, что файлы ТО/чеки/длина 26 загружены и содержат эту дату."
-        )
+        ), None
 
     # Период MTD
     mtd_start_26, mtd_end_26 = period_mtd(report_date)
@@ -580,15 +545,15 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
         lfl_store["AVG"] = (s26_mtd.loc[common, "AVG"] - s25_mtd.loc[common, "AVG"]) / s25_mtd.loc[common, "AVG"]
         lfl_store = lfl_store.replace([np.inf, -np.inf], np.nan)
 
-    top_to, anti_to = top_anti_3(lfl_store["TO"]) if common else (pd.Series(dtype=float), pd.Series(dtype=float))
-    top_checks, anti_checks = top_anti_3(lfl_store["CHECKS"]) if common else (pd.Series(dtype=float), pd.Series(dtype=float))
-    top_avg, anti_avg = top_anti_3(lfl_store["AVG"]) if common else (pd.Series(dtype=float), pd.Series(dtype=float))
+    TOP_N = 5
+    top_to, anti_to = top_anti_n(lfl_store["TO"], TOP_N) if common else (pd.Series(dtype=float), pd.Series(dtype=float))
+    top_checks, anti_checks = top_anti_n(lfl_store["CHECKS"], TOP_N) if common else (pd.Series(dtype=float), pd.Series(dtype=float))
+    top_avg, anti_avg = top_anti_n(lfl_store["AVG"], TOP_N) if common else (pd.Series(dtype=float), pd.Series(dtype=float))
 
     # Сколько лавок в плюсе/минусе по LFL Чекам (MTD)
     pos_checks = int((lfl_store["CHECKS"] > 0).sum()) if common else 0
     neg_checks = int((lfl_store["CHECKS"] < 0).sum()) if common else 0
     total_lfl_stores = int(lfl_store["CHECKS"].dropna().shape[0]) if common else 0
-
 
     # Динамика неделя к неделе | Неделя W vs W-1 (по введённой дате)
     cur_iso_year, cur_week = iso_week_year(report_date)
@@ -608,10 +573,9 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
     wow25_to = pct_change(wk25["to"], wk25_prev["to"])
     wow25_checks = pct_change(wk25["checks"], wk25_prev["checks"])
     wow25_avg = pct_change(wk25["avg"], wk25_prev["avg"])
+
     # =========================
     # СЛУЖЕБНОЕ СООБЩЕНИЕ (отдельным сообщением)
-    # - Исключённые из LFL MTD (лавки, которые есть только в одном из годов за период)
-    # - База лавок для недели к неделе (сколько лавок участвовало в каждой неделе каждого года)
     # =========================
     stores26_mtd = set(s26_mtd.index.astype(str)) if not s26_mtd.empty else set()
     stores25_mtd = set(s25_mtd.index.astype(str)) if not s25_mtd.empty else set()
@@ -621,7 +585,6 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
         nm_ = store_name.get(code_, "").strip()
         return f"{code_} {nm_}".strip() if nm_ else code_
 
-    # База лавок по неделям (у WoW ничего не исключаем)
     wk26_stores = int(w26[(w26["iso_year"] == cur_iso_year) & (w26["iso_week"] == cur_week)]["store_code"].nunique())
     wk26_prev_stores = int(w26[(w26["iso_year"] == prev_iso_year) & (w26["iso_week"] == prev_week)]["store_code"].nunique())
     wk25_stores = int(w25[(w25["iso_year"] == (cur_iso_year - 1)) & (w25["iso_week"] == cur_week)]["store_code"].nunique())
@@ -646,8 +609,7 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
     extra_lines.append(f"2025: <b>{wk25_stores}</b> (нед.{cur_week}) / <b>{wk25_prev_stores}</b> (нед.{prev_week})")
     extra_text = "\n".join(extra_lines)
 
-
-    # ====== СБОРКА ТЕКСТА (как в эталоне) ======
+    # ====== СБОРКА ТЕКСТА ======
     period_str = f"{mtd_start_26:%d.%m}–{mtd_end_26:%d.%m}"
     report_date_str = f"{report_date:%d.%m.%y}"
     week_header = f"Неделя {cur_week} vs {prev_week}"
@@ -659,7 +621,7 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
         name = str(r["rm"]).strip()
         max_name = max(max_name, len(name))
         rm_lines.append((name, r["perf"]))
-    max_name = min(max_name, 28)  # чтобы не раздувало
+    max_name = min(max_name, 28)
 
     def _store_label(code: str) -> str:
         nm = store_name.get(code, "").strip()
@@ -699,18 +661,18 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
     )
     lines.append("")
 
-    def render_top_anti_block(title: str, top_s: pd.Series, anti_s: pd.Series):
+    def render_top_anti_block(title: str, top_s: pd.Series, anti_s: pd.Series, n: int = 5):
         lines.append(SEP)
         lines.append(title)
         lines.append("")
-        lines.append("ТОП-3:")
+        lines.append(f"ТОП-{n}:")
         if top_s is None or len(top_s) == 0:
             lines.append("—")
         else:
             for i, (k, v) in enumerate(top_s.items(), start=1):
                 lines.append(f"{i}) {_store_label(k)}  <b>{fmt_pct_signed(v)}</b>")
         lines.append("")
-        lines.append("АНТИ-ТОП-3:")
+        lines.append(f"АНТИ-ТОП-{n}:")
         if anti_s is None or len(anti_s) == 0:
             lines.append("—")
         else:
@@ -718,9 +680,9 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
                 lines.append(f"{i}) {_store_label(k)}  <b>{fmt_pct_signed(v)}</b>")
         lines.append("")
 
-    render_top_anti_block("📊 <b>ТОП / АНТИ-ТОП LFL (MTD) — ТО</b>", top_to, anti_to)
-    render_top_anti_block("📊 <b>ТОП / АНТИ-ТОП LFL (MTD) — Чеки</b>", top_checks, anti_checks)
-    render_top_anti_block("📊 <b>ТОП / АНТИ-ТОП LFL (MTD) — Ср. чек</b>", top_avg, anti_avg)
+    render_top_anti_block("📊 <b>ТОП / АНТИ-ТОП LFL (MTD) — ТО</b>", top_to, anti_to, TOP_N)
+    render_top_anti_block("📊 <b>ТОП / АНТИ-ТОП LFL (MTD) — Чеки</b>", top_checks, anti_checks, TOP_N)
+    render_top_anti_block("📊 <b>ТОП / АНТИ-ТОП LFL (MTD) — Ср. чек</b>", top_avg, anti_avg, TOP_N)
 
     lines.append(SEP)
     lines.append(f"📊 <b>ДИНАМИКА НЕДЕЛЯ К НЕДЕЛЕ</b> | {week_header}")
@@ -749,7 +711,7 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
         f"2) Выполнение плана по сети: {fmt_pct_plain(perf_net)} (план на дату) — при текущем темпе возможен риск недобора."
     )
     lines.append(
-        "3) Фокус — лавки АНТИ-ТОП-3 по LFL: они дают непропорционально большой минус сети."
+        "3) Фокус — лавки АНТИ-ТОП по LFL: они дают непропорционально большой минус сети."
     )
     lines.append(
         f"4) Динамика неделя к неделе ({week_header}): 2026 (ТО {fmt_pct_signed(wow26_to)}, Чеки {fmt_pct_signed(wow26_checks)}, Ср. чек {fmt_pct_signed(wow26_avg)}) vs 2025 (ТО {fmt_pct_signed(wow25_to)}, Чеки {fmt_pct_signed(wow25_checks)}, Ср. чек {fmt_pct_signed(wow25_avg)})."
@@ -757,7 +719,6 @@ def build_report(report_date: datetime) -> Tuple[str, Optional[str]]:
     lines.append(
         f"5) LFL по чекам: в плюсе {pos_checks} лавок, в минусе {neg_checks} лавок (база LFL: {total_lfl_stores})."
     )
-
 
     return ("\n".join(lines), extra_text)
 
