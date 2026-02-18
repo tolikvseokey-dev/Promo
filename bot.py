@@ -13,7 +13,7 @@ from telebot import types
 # =========================
 # НАСТРОЙКИ
 # =========================
-BOT_VERSION = "analytics-bot-2026-02-17-modeA-top5-rm-no-tops"
+BOT_VERSION = "analytics-bot-2026-02-17-modeA-top5-rm-no-tops-cut50"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
@@ -401,8 +401,13 @@ def per_store_period(w: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) ->
     return g
 
 
-def top_anti_n(series: pd.Series, n: int = 5) -> Tuple[pd.Series, pd.Series]:
+def top_anti_n(series: pd.Series, n: int = 5, min_pct: float = -0.5, max_pct: float = 0.5) -> Tuple[pd.Series, pd.Series]:
+    """
+    ТОП/АНТИ-ТОП с фильтром выбросов:
+    исключаем значения > +50% и < -50% (по умолчанию).
+    """
     s = series.replace([np.inf, -np.inf], np.nan).dropna()
+    s = s[(s >= min_pct) & (s <= max_pct)]
     top = s.sort_values(ascending=False).head(n)
     anti = s.sort_values(ascending=True).head(n)
     return top, anti
@@ -559,11 +564,12 @@ def build_report(report_date: datetime, rm_filter: Optional[str] = None) -> Tupl
         lfl_store = lfl_store.replace([np.inf, -np.inf], np.nan)
 
     if (not rm_filter) and common:
-        top_to, anti_to = top_anti_n(lfl_store["TO"], TOP_N)
-        top_checks, anti_checks = top_anti_n(lfl_store["CHECKS"], TOP_N)
-        top_avg, anti_avg = top_anti_n(lfl_store["AVG"], TOP_N)
+        # ВАЖНО: исключаем выбросы > +50% и < -50% для ТОП/АНТИ-ТОП
+        top_to, anti_to = top_anti_n(lfl_store["TO"], TOP_N, -0.5, 0.5)
+        top_checks, anti_checks = top_anti_n(lfl_store["CHECKS"], TOP_N, -0.5, 0.5)
+        top_avg, anti_avg = top_anti_n(lfl_store["AVG"], TOP_N, -0.5, 0.5)
 
-    # Сколько лавок в плюсе/минусе по LFL Чекам (MTD)
+    # Сколько лавок в плюсе/минусе по LFL Чекам (MTD) — считаем по базе (без обрезки)
     pos_checks = int((lfl_store["CHECKS"] > 0).sum()) if common else 0
     neg_checks = int((lfl_store["CHECKS"] < 0).sum()) if common else 0
     total_lfl_stores = int(lfl_store["CHECKS"].dropna().shape[0]) if common else 0
@@ -654,7 +660,6 @@ def build_report(report_date: datetime, rm_filter: Optional[str] = None) -> Tupl
     lines.append("")
 
     if not rm_filter:
-        # список всех РМ
         rm_lines = []
         max_name = 0
         for _, r in rm_tbl.iterrows():
@@ -668,7 +673,6 @@ def build_report(report_date: datetime, rm_filter: Optional[str] = None) -> Tupl
             pad = " " * (max_name - len(n))
             lines.append(f"{n}{pad} — <b>{fmt_pct_plain(perf)}</b>")
     else:
-        # 1 строка по выбранному РМ с ТО/план/вып
         r = rm_tbl.iloc[0] if not rm_tbl.empty else None
         rm_name = str(rm_filter).strip()
         fact_rm = float(r["fact"]) if r is not None and not pd.isna(r["fact"]) else np.nan
