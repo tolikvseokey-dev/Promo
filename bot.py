@@ -13,7 +13,7 @@ from telebot import types
 # =========================
 # НАСТРОЙКИ
 # =========================
-BOT_VERSION = "analytics-bot-2026-02-17-modeA-top5-rm-no-tops-cut50"
+BOT_VERSION = "analytics-bot-2026-02-17-modeA-top5-cut50-svc67-rm-allstores"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
@@ -144,7 +144,6 @@ def parse_input_date(text: str) -> Optional[datetime]:
         return None
 
     t = str(text).strip()
-
     t = t.replace("ю", ".").replace("Ю", ".")
     t = t.replace("\\", ".").replace("/", ".").replace(",", ".").replace("-", ".").replace("_", ".")
     t = re.sub(r"\s+", " ", t).strip()
@@ -401,16 +400,39 @@ def per_store_period(w: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) ->
     return g
 
 
+def filter_outliers_pct(series: pd.Series, min_pct: float = -0.5, max_pct: float = 0.5) -> pd.Series:
+    """Фильтр выбросов для топов: исключаем < -50% и > +50%."""
+    s = series.replace([np.inf, -np.inf], np.nan).dropna()
+    return s[(s >= min_pct) & (s <= max_pct)]
+
+
 def top_anti_n(series: pd.Series, n: int = 5, min_pct: float = -0.5, max_pct: float = 0.5) -> Tuple[pd.Series, pd.Series]:
     """
     ТОП/АНТИ-ТОП с фильтром выбросов:
     исключаем значения > +50% и < -50% (по умолчанию).
     """
-    s = series.replace([np.inf, -np.inf], np.nan).dropna()
-    s = s[(s >= min_pct) & (s <= max_pct)]
+    s = filter_outliers_pct(series, min_pct, max_pct)
     top = s.sort_values(ascending=False).head(n)
     anti = s.sort_values(ascending=True).head(n)
     return top, anti
+
+
+def ranks_slice(series: pd.Series, direction: str, start_rank: int, end_rank: int,
+                min_pct: float = -0.5, max_pct: float = 0.5) -> pd.Series:
+    """
+    Вытаскиваем места start_rank..end_rank из отсортированного ряда (1-based),
+    с учетом фильтра выбросов как для топов.
+    direction: "top" (desc) | "anti" (asc)
+    """
+    s = filter_outliers_pct(series, min_pct, max_pct)
+    if direction == "top":
+        s = s.sort_values(ascending=False)
+    else:
+        s = s.sort_values(ascending=True)
+
+    start_i = max(0, start_rank - 1)
+    end_i = max(0, end_rank)  # срез до end_rank (не включая, поэтому берем end_rank)
+    return s.iloc[start_i:end_i]
 
 
 def weekly_network(w: pd.DataFrame, iso_year: int, iso_week: int) -> Dict[str, float]:
@@ -552,10 +574,7 @@ def build_report(report_date: datetime, rm_filter: Optional[str] = None) -> Tupl
     lfl_checks = pct_change(ch26, ch25)
     lfl_avg = pct_change(avg26, avg25)
 
-    # Только для сети считаем ТОП/АНТИ-ТОП (для РМ — убираем полностью)
-    TOP_N = 5
-    top_to = anti_to = top_checks = anti_checks = top_avg = anti_avg = pd.Series(dtype=float)
-
+    # Пер-магазинный LFL
     lfl_store = pd.DataFrame(index=common)
     if common:
         lfl_store["TO"] = (s26_mtd.loc[common, "TO"] - s25_mtd.loc[common, "TO"]) / s25_mtd.loc[common, "TO"]
@@ -563,11 +582,25 @@ def build_report(report_date: datetime, rm_filter: Optional[str] = None) -> Tupl
         lfl_store["AVG"] = (s26_mtd.loc[common, "AVG"] - s25_mtd.loc[common, "AVG"]) / s25_mtd.loc[common, "AVG"]
         lfl_store = lfl_store.replace([np.inf, -np.inf], np.nan)
 
+    # ТОП/АНТИ-ТОП — только по сети
+    TOP_N = 5
+    top_to = anti_to = top_checks = anti_checks = top_avg = anti_avg = pd.Series(dtype=float)
+    top67_to = anti67_to = top67_checks = anti67_checks = top67_avg = anti67_avg = pd.Series(dtype=float)
+
     if (not rm_filter) and common:
-        # ВАЖНО: исключаем выбросы > +50% и < -50% для ТОП/АНТИ-ТОП
         top_to, anti_to = top_anti_n(lfl_store["TO"], TOP_N, -0.5, 0.5)
         top_checks, anti_checks = top_anti_n(lfl_store["CHECKS"], TOP_N, -0.5, 0.5)
         top_avg, anti_avg = top_anti_n(lfl_store["AVG"], TOP_N, -0.5, 0.5)
+
+        # места 6-7 (после того же фильтра ±50%)
+        top67_to = ranks_slice(lfl_store["TO"], "top", 6, 7, -0.5, 0.5)
+        anti67_to = ranks_slice(lfl_store["TO"], "anti", 6, 7, -0.5, 0.5)
+
+        top67_checks = ranks_slice(lfl_store["CHECKS"], "top", 6, 7, -0.5, 0.5)
+        anti67_checks = ranks_slice(lfl_store["CHECKS"], "anti", 6, 7, -0.5, 0.5)
+
+        top67_avg = ranks_slice(lfl_store["AVG"], "top", 6, 7, -0.5, 0.5)
+        anti67_avg = ranks_slice(lfl_store["AVG"], "anti", 6, 7, -0.5, 0.5)
 
     # Сколько лавок в плюсе/минусе по LFL Чекам (MTD) — считаем по базе (без обрезки)
     pos_checks = int((lfl_store["CHECKS"] > 0).sum()) if common else 0
@@ -625,6 +658,37 @@ def build_report(report_date: datetime, rm_filter: Optional[str] = None) -> Tupl
     extra_lines.append(f"<b>База лавок | Неделя к неделе</b> (Неделя {cur_week} vs {prev_week}):")
     extra_lines.append(f"2026: <b>{wk26_stores}</b> (нед.{cur_week}) / <b>{wk26_prev_stores}</b> (нед.{prev_week})")
     extra_lines.append(f"2025: <b>{wk25_stores}</b> (нед.{cur_week}) / <b>{wk25_prev_stores}</b> (нед.{prev_week})")
+
+    # ДОБАВКА: места 6-7 по топам/анти-топам (только по сети)
+    if not rm_filter:
+        def _render_67(title: str, top67: pd.Series, anti67: pd.Series):
+            extra_lines.append("")
+            extra_lines.append(f"<b>{title}</b> (места 6–7, после фильтра ±50%)")
+            extra_lines.append("ТОП 6–7:")
+            if top67 is None or len(top67) == 0:
+                extra_lines.append("—")
+            else:
+                # ranks_slice вернул срез — индексы сохраняются, поэтому считаем ранги вручную (6..)
+                r = 6
+                for k, v in top67.items():
+                    extra_lines.append(f"{r}) {_store_label_plain(k)} — {fmt_pct_signed(v)}")
+                    r += 1
+            extra_lines.append("АНТИ 6–7:")
+            if anti67 is None or len(anti67) == 0:
+                extra_lines.append("—")
+            else:
+                r = 6
+                for k, v in anti67.items():
+                    extra_lines.append(f"{r}) {_store_label_plain(k)} — {fmt_pct_signed(v)}")
+                    r += 1
+
+        extra_lines.append("")
+        extra_lines.append(SEP)
+        extra_lines.append("🧩 <b>ТОП/АНТИ-ТОП РЕЗЕРВ</b> (для ручной корректировки)")
+        _render_67("LFL (MTD) — ТО", top67_to, anti67_to)
+        _render_67("LFL (MTD) — Чеки", top67_checks, anti67_checks)
+        _render_67("LFL (MTD) — Ср. чек", top67_avg, anti67_avg)
+
     extra_text = "\n".join(extra_lines)
 
     # ====== СБОРКА ТЕКСТА ======
@@ -717,6 +781,31 @@ def build_report(report_date: datetime, rm_filter: Optional[str] = None) -> Tupl
         render_top_anti_block("📊 <b>ТОП / АНТИ-ТОП LFL (MTD) — ТО</b>", top_to, anti_to, TOP_N)
         render_top_anti_block("📊 <b>ТОП / АНТИ-ТОП LFL (MTD) — Чеки</b>", top_checks, anti_checks, TOP_N)
         render_top_anti_block("📊 <b>ТОП / АНТИ-ТОП LFL (MTD) — Ср. чек</b>", top_avg, anti_avg, TOP_N)
+
+    # В режиме РМ — вместо топов: ВСЕ лавки РМ с LFL по показателям
+    if rm_filter:
+        lines.append(SEP)
+        lines.append("🏪 <b>ЛАВКИ РЕГИОНА</b> | LFL MTD (2026 vs 2025)")
+        lines.append("")
+        if lfl_store.empty:
+            lines.append("—")
+        else:
+            tmp = lfl_store.copy()
+            tmp = tmp.reset_index().rename(columns={"index": "store_code"})
+            # сортируем по ТО (по убыванию), чтобы было “как рейтинг”, но это не топы — это весь список
+            tmp = tmp.sort_values(by="TO", ascending=False, na_position="last")
+
+            for _, row in tmp.iterrows():
+                code = str(row["store_code"])
+                nm = store_name.get(code, "").strip()
+                label = f"{code} {nm}".strip() if nm else code
+                lines.append(
+                    f"• <b>{label}</b>\n"
+                    f"  ТО: <b>{fmt_pct_signed(row.get('TO', np.nan))}</b>   |   "
+                    f"Чеки: <b>{fmt_pct_signed(row.get('CHECKS', np.nan))}</b>   |   "
+                    f"Ср. чек: <b>{fmt_pct_signed(row.get('AVG', np.nan))}</b>"
+                )
+            lines.append("")
 
     lines.append(SEP)
     lines.append(f"📊 <b>ДИНАМИКА НЕДЕЛЯ К НЕДЕЛЕ</b> | {week_header}")
